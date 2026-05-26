@@ -23,17 +23,36 @@ import {
   Checkbox,
 } from '@mantine/core';
 import {
-  IconArrowRight,
-  IconBook2,
+  IconTerminal2,
+  IconPlus,
+  IconSparkles,
+  IconSchool,
   IconBriefcase,
-  IconMessages,
+  IconSearch,
+  IconChecklist,
+  IconCode,
+  IconHammer,
   IconRocket,
+  IconProgress,
+  IconWand,
+  IconServer,
+  IconCalendar,
+  IconPuzzle,
+  IconUser,
+  IconShieldLock,
+  IconBrandDiscord,
+  IconVectorBezier2,
+  IconVideo,
+  IconCamera,
+  IconFolderOpen,
+  IconHistory,
 } from '@tabler/icons-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { apiUrl } from '../libs/api-base';
 import { resolveSelectedProvider, setSelectedProvider } from '../libs/llm';
-import { MAIN_NAV_ITEMS, type MainNavItem } from '../libs/main-nav';
+import { useSessionRoots } from '../libs/session-roots';
+import ExploreView from '../components/explore/ExploreView';
 
 const API_BASE_URL = apiUrl('/api');
 axios.defaults.withCredentials = true;
@@ -46,6 +65,8 @@ const isProtectedProcessSession = (sessionName: string): boolean => (
 interface LlmProvider {
   id: string;
   name: string;
+  models: string[];
+  effort_levels: string[];
 }
 
 interface ExternalTmuxSession {
@@ -95,19 +116,6 @@ interface SkillCategory {
   skills: SkillItem[];
 }
 
-interface SubagentItem {
-  name: string;
-  fileName: string;
-  description: string;
-  disabled: boolean;
-}
-
-interface SubagentCategory {
-  id: string;
-  label: string;
-  subagents: SubagentItem[];
-}
-
 interface ScheduleItem {
   id: string;
   name: string;
@@ -151,6 +159,7 @@ const EMPTY_MCP_FORM: McpFormData = {
 };
 
 type ActiveView =
+  | 'explore'
   | 'home'
   | 'live-terminal'
   | 'learning'
@@ -162,7 +171,6 @@ type ActiveView =
   | 'processes'
   | 'discord-bot'
   | 'skills'
-  | 'subagents'
   | 'mcp-servers'
   | 'schedule'
   | 'extensions'
@@ -212,20 +220,18 @@ interface EnvSafeguardStatus {
   reason?: string;
 }
 
-interface HomePageProps {
-  initialView?: ActiveView;
-}
-
-export default function HomePage({ initialView = 'home' }: HomePageProps) {
+export default function HomePage() {
   const router = useRouter();
   const theme = useMantineTheme();
   const isDevMode = process.env.NODE_ENV === 'development';
   const [opened, setOpened] = useState(false);
-  const [activeView, setActiveView] = useState<ActiveView>(initialView);
+  const [activeView, setActiveView] = useState<ActiveView>('explore');
   const [promptText, setPromptText] = useState('');
   const [newSessionWorkflow, setNewSessionWorkflow] = useState<string | null>(null);
   const [llmProviders, setLlmProviders] = useState<LlmProvider[]>([]);
   const [llmProvider, setLlmProvider] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [selectedEffort, setSelectedEffort] = useState<string | null>(null);
   const [liveSessionName, setLiveSessionName] = useState<string | null>(null);
   const [liveSessionMode, setLiveSessionMode] = useState<LiveSessionMode>('llm');
   const [liveSessionPath, setLiveSessionPath] = useState<string>('');
@@ -254,19 +260,6 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
   const [skillUsePrompt, setSkillUsePrompt] = useState('');
   const [skillEditSaving, setSkillEditSaving] = useState(false);
   const [skillEditOutput, setSkillEditOutput] = useState('');
-  const [subagentCategories, setSubagentCategories] = useState<SubagentCategory[]>([]);
-  const [subagentDisabled, setSubagentDisabled] = useState<Set<string>>(new Set());
-  const [subagentSaving, setSubagentSaving] = useState(false);
-  const [subagentSaveOutput, setSubagentSaveOutput] = useState('');
-  const [subagentActiveTab, setSubagentActiveTab] = useState('all');
-  const [subagentSearchText, setSubagentSearchText] = useState('');
-  const [subagentAppliedSearch, setSubagentAppliedSearch] = useState('');
-  const [subagentSearchFocused, setSubagentSearchFocused] = useState(false);
-  const [subagentSubScreen, setSubagentSubScreen] = useState<null | { mode: 'use' | 'view' | 'edit'; subagentName: string; categoryId: string; createSubagent?: boolean }>(null);
-  const [subagentContent, setSubagentContent] = useState('');
-  const [subagentUsePrompt, setSubagentUsePrompt] = useState('');
-  const [subagentEditSaving, setSubagentEditSaving] = useState(false);
-  const [subagentEditOutput, setSubagentEditOutput] = useState('');
   const [schedules, setSchedules] = useState<ScheduleItem[]>([]);
   const [scheduleEditing, setScheduleEditing] = useState<null | string>(null);
   const [scheduleForm, setScheduleForm] = useState<ScheduleFormData>({
@@ -304,7 +297,6 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
   const [newSessionNextNodeTrigger, setNewSessionNextNodeTrigger] = useState<NextNodeTrigger>('auto_continue');
   const [newSessionWorkflowResumeAvailable, setNewSessionWorkflowResumeAvailable] = useState(false);
   const [newSessionWorkflowResume, setNewSessionWorkflowResume] = useState(false);
-  const [newSessionPathOverride, setNewSessionPathOverride] = useState('');
   const [continuingWorkflow, setContinuingWorkflow] = useState(false);
   const [defaultLlmProvider, setDefaultLlmProvider] = useState<string>('');
   const [defaultDoctorProvider, setDefaultDoctorProvider] = useState<string>('');
@@ -330,6 +322,12 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
   const [profileError, setProfileError] = useState('');
   const [timezoneList, setTimezoneList] = useState<string[]>([]);
   const [timezoneFocused, setTimezoneFocused] = useState(false);
+  const {
+    sessionRootOptions,
+    hasSessionWorktrees,
+    selectedSessionPath,
+    setSelectedSessionPath,
+  } = useSessionRoots();
 
   const fetchLlmProviders = useCallback(async () => {
     try {
@@ -345,6 +343,9 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
         setSelectedProvider(defaultId);
       }
       setLlmProvider(defaultId);
+      const defaultProvider = providers.find((p) => p.id === defaultId);
+      setSelectedModel(defaultProvider?.models?.[0] || null);
+      setSelectedEffort(null);
     } catch (err) {
       console.error('Failed to fetch LLM providers:', err);
     }
@@ -391,23 +392,6 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
       setSkillDisabled(disabled);
     } catch (err) {
       console.error('Failed to fetch skills:', err);
-    }
-  }, []);
-
-  const fetchSubagents = useCallback(async () => {
-    try {
-      const res = await axios.get(`${API_BASE_URL}/config/subagents`);
-      const cats: SubagentCategory[] = res.data?.categories || [];
-      setSubagentCategories(cats);
-      const disabled = new Set<string>();
-      for (const cat of cats) {
-        for (const subagent of cat.subagents) {
-          if (subagent.disabled) disabled.add(subagent.name);
-        }
-      }
-      setSubagentDisabled(disabled);
-    } catch (err) {
-      console.error('Failed to fetch subagents:', err);
     }
   }, []);
 
@@ -604,12 +588,6 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
   }, [activeView, fetchSkills]);
 
   useEffect(() => {
-    if (activeView === 'subagents') {
-      void fetchSubagents();
-    }
-  }, [activeView, fetchSubagents]);
-
-  useEffect(() => {
     if (activeView === 'schedule') {
       void fetchSchedules();
       void fetchSkills();
@@ -662,7 +640,7 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
         ? {
             workflow: newSessionWorkflow,
             prompt: trimmedPrompt,
-            path: newSessionPathOverride || undefined,
+            path: selectedSessionPath || undefined,
             sandbox: newSessionSandbox,
             auto: newSessionAuto,
             network: newSessionNetwork,
@@ -673,11 +651,13 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
         : {
             provider_id: provider,
             prompt: trimmedPrompt,
-            path: newSessionPathOverride || undefined,
+            path: selectedSessionPath || undefined,
             sandbox: newSessionSandbox,
             auto: newSessionAuto,
             network: newSessionNetwork,
             native_terminal: newSessionNativeTerminal,
+            model: selectedModel || undefined,
+            effort: selectedEffort || undefined,
           };
       const res = await axios.post(endpoint, payload);
       const sessionName: string | undefined = res.data?.session?.name;
@@ -694,7 +674,7 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
         } else {
           setLiveSessionName(sessionName);
           setLiveSessionMode('llm');
-          setLiveSessionPath(String(res.data?.session?.cwd || newSessionPathOverride || ''));
+          setLiveSessionPath(String(res.data?.session?.cwd || selectedSessionPath || ''));
           setActiveView('live-terminal');
         }
         if (newSessionWorkflow) {
@@ -702,7 +682,6 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
           setWorkflowExecuteStatus(null);
         }
         setPromptText('');
-        setNewSessionPathOverride('');
         setNewSessionWorkflow(null);
         setNewSessionNextNodeTrigger('auto_continue');
         setNewSessionWorkflowResumeAvailable(false);
@@ -719,11 +698,13 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
     newSessionNativeTerminal,
     newSessionNetwork,
     newSessionNextNodeTrigger,
-    newSessionPathOverride,
     newSessionSandbox,
     newSessionWorkflow,
     newSessionWorkflowResume,
     promptText,
+    selectedModel,
+    selectedEffort,
+    selectedSessionPath,
     startingSession,
   ]);
 
@@ -760,51 +741,43 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
       new_session,
       new_terminal,
       view,
+      workflow,
+      next_node_trigger,
+      resume,
+      resume_available,
+      path,
+      ...restQuery
     } = router.query;
 
-    if (new_session === 'true') {
-      void router.replace({
-        pathname: '/agent-sessions',
-        query: {
-          new: 'true',
-          ...(typeof prompt === 'string' && prompt ? { prompt } : {}),
-        },
-      });
+    if (new_session === 'true' && prompt) {
+      setPromptText(prompt as string);
+      setSelectedSessionPath(typeof path === 'string' ? path : '');
+      setNewSessionWorkflow(typeof workflow === 'string' && workflow ? workflow : null);
+      setNewSessionNextNodeTrigger(next_node_trigger === 'start_by_prompt' ? 'start_by_prompt' : 'auto_continue');
+      setNewSessionWorkflowResumeAvailable(resume_available === 'true');
+      setNewSessionWorkflowResume(resume === 'true');
+      setActiveView('home');
+      void router.replace({ pathname: '/', query: restQuery }, undefined, { shallow: true });
       return;
     }
 
     if (new_terminal === 'true') {
-      void router.replace({ pathname: '/agent-sessions', query: { new: 'true' } });
+      const requestedPath = typeof path === 'string' ? path : '';
+      const launchKey = requestedPath || '__project_root__';
+      if (terminalQueryLaunchRef.current === launchKey) return;
+      terminalQueryLaunchRef.current = launchKey;
+      setActiveView('home');
+      void handleStartShellTerminal(requestedPath);
+      void router.replace({ pathname: '/', query: restQuery }, undefined, { shallow: true });
       return;
     }
 
     terminalQueryLaunchRef.current = '';
 
-    if (view === 'home') {
-      void router.replace('/agent-sessions');
-      return;
-    }
-
-    const dedicatedViewRoutes: Partial<Record<ActiveView, string>> = {
-      processes: '/processes',
-      'discord-bot': '/discord-bot',
-      skills: '/skills',
-      subagents: '/subagents',
-      'mcp-servers': '/mcp-servers',
-      schedule: '/schedules',
-      extensions: '/extensions',
-      'ai-security': '/ai-security',
-      profile: '/profile',
-    };
-    if (typeof view === 'string' && dedicatedViewRoutes[view as ActiveView]) {
-      void router.replace(dedicatedViewRoutes[view as ActiveView] as string);
-      return;
-    }
-
     if (typeof view === 'string' && view) {
       const validViews: ActiveView[] = [
-        'learning', 'projects', 'research', 'tasks',
-        'development', 'processes', 'discord-bot', 'skills', 'subagents', 'mcp-servers',
+        'explore', 'home', 'live-terminal', 'learning', 'projects', 'research', 'tasks',
+        'development', 'processes', 'discord-bot', 'skills', 'mcp-servers',
         'schedule', 'extensions', 'ai-security', 'profile',
       ];
       if (validViews.includes(view as ActiveView)) {
@@ -840,13 +813,52 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
     }
   };
 
-  type HomeNavItem = MainNavItem & { action?: () => void; disabled?: boolean; active?: boolean };
-  const navItems: HomeNavItem[] = MAIN_NAV_ITEMS.map((item) => {
-    return {
-      ...item,
-      action: () => { void router.push(item.href); },
-    };
-  });
+  const navItems: { label: string; view?: ActiveView; href?: string; icon: React.ReactNode; action?: () => void; dividerBefore?: string; disabled?: boolean; active?: boolean }[] = [
+    {
+      label: 'Explore',
+      href: '/?view=explore',
+      view: 'explore',
+      icon: <IconSparkles size="1rem" />,
+    },
+    {
+      label: 'New Session',
+      dividerBefore: '',
+      href: '/?view=home',
+      view: 'home',
+      icon: <IconPlus size="1rem" />,
+      action: () => {
+        if (activeView === 'live-terminal') {
+          handleDetachSession();
+        } else if (activeView !== 'home') {
+          setActiveView('home');
+        }
+        void router.push('/?view=home');
+      },
+      disabled: activeView === 'home',
+    },
+    { label: 'Live Sessions', href: '/terminals', icon: <IconTerminal2 size="1rem" />, action: () => { void router.push('/terminals'); } },
+    { label: 'Session Histories', href: '/terminal-histories', icon: <IconHistory size="1rem" />, action: () => { void router.push('/terminal-histories'); } },
+    { dividerBefore: 'Workspace', label: 'Learning', href: '/courses', icon: <IconSchool size="1rem" />, action: () => router.push('/courses') },
+    { label: 'Vibe Coding', href: '/vibe-coding', icon: <IconBriefcase size="1rem" />, action: () => router.push('/vibe-coding') },
+    { label: 'Research', href: '/research', icon: <IconSearch size="1rem" />, action: () => router.push('/research') },
+    { label: 'Tasks', href: '/tasks', icon: <IconChecklist size="1rem" />, action: () => router.push('/tasks') },
+    { label: 'Media', href: '/media', icon: <IconVideo size="1rem" />, action: () => router.push('/media') },
+    { label: 'File Manager', href: '/file-manager', icon: <IconFolderOpen size="1rem" />, action: () => router.push('/file-manager') },
+    { dividerBefore: 'Skill Pilot', label: 'Development', href: '/skill-pilot-development', icon: <IconCode size="1rem" />, action: () => router.push('/skill-pilot-development') },
+    { label: 'Codeware', href: '/codeware', icon: <IconHammer size="1rem" />, action: () => router.push('/codeware') },
+    { dividerBefore: 'Commercial Project', label: 'Dev Swarm', href: '/dev-swarm', icon: <IconRocket size="1rem" />, action: () => router.push('/dev-swarm') },
+    { dividerBefore: '', label: 'Processes', href: '/?view=processes', view: 'processes', icon: <IconProgress size="1rem" /> },
+    { label: 'Discord Bot', href: '/?view=discord-bot', view: 'discord-bot', icon: <IconBrandDiscord size="1rem" /> },
+    { label: 'Live Avatar', href: '/live-avatar', icon: <IconVideo size="1rem" />, action: () => router.push('/live-avatar') },
+    { label: 'Security Cameras', href: '/cameras', icon: <IconCamera size="1rem" />, action: () => router.push('/cameras') },
+    { dividerBefore: '', label: 'Skills', href: '/?view=skills', view: 'skills', icon: <IconWand size="1rem" /> },
+    { label: 'Workflows', href: '/workflows', icon: <IconVectorBezier2 size="1rem" />, action: () => router.push('/workflows') },
+    { label: 'MCP Servers', href: '/?view=mcp-servers', view: 'mcp-servers', icon: <IconServer size="1rem" /> },
+    { label: 'Schedules', href: '/?view=schedule', view: 'schedule', icon: <IconCalendar size="1rem" /> },
+    { label: 'Extensions', href: '/?view=extensions', view: 'extensions', icon: <IconPuzzle size="1rem" /> },
+    { label: 'AI & Security', href: '/?view=ai-security', view: 'ai-security', icon: <IconShieldLock size="1rem" /> },
+    { label: 'Profile', href: '/?view=profile', view: 'profile', icon: <IconUser size="1rem" /> },
+  ];
 
   const handleNavItemClick = (event: React.MouseEvent, item: typeof navItems[number]) => {
     if (item.disabled) return;
@@ -861,7 +873,7 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
     if (item.action) {
       item.action();
     } else if (item.view) {
-      setActiveView(item.view as ActiveView);
+      setActiveView(item.view);
     }
     setOpened(false);
   };
@@ -881,7 +893,7 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
         );
       }
 
-      const isActive = item.active ?? (item.view ? activeView === item.view : router.pathname === item.href);
+      const isActive = item.active ?? (item.view ? activeView === item.view : false);
 
       elements.push(
         <NavLink
@@ -903,121 +915,159 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
     <div style={{
       display: 'flex',
       flexDirection: 'column',
-      justifyContent: 'space-between',
+      alignItems: 'center',
+      justifyContent: 'center',
       height: '100%',
-      minHeight: 'calc(100vh - 60px)',
-      padding: 'clamp(32px, 6vw, 72px)',
+      padding: '40px 20px',
       position: 'relative',
-      overflow: 'hidden',
-      background: theme.colorScheme === 'dark'
-        ? 'linear-gradient(135deg, #101113 0%, #18201c 58%, #111827 100%)'
-        : 'linear-gradient(135deg, #f8fbff 0%, #f2f7f1 56%, #fff7ed 100%)',
     }}>
-      <div style={{ width: '100%', maxWidth: 1180, margin: '0 auto' }}>
-        <div style={{ maxWidth: 860 }}>
-          <Text
-            style={{
-              fontSize: 'clamp(44px, 7vw, 88px)',
-              lineHeight: 1,
-              fontWeight: 900,
-              letterSpacing: 0,
-              color: theme.colorScheme === 'dark' ? '#f8fafc' : '#111827',
-            }}
-          >
-            Your personal AI workspace
-          </Text>
-          <Text
-            mt={18}
-            style={{
-              fontSize: 'clamp(28px, 4.2vw, 52px)',
-              lineHeight: 1.08,
-              fontWeight: 800,
-              letterSpacing: 0,
-              color: theme.colorScheme === 'dark' ? '#b7f7d1' : '#157347',
-            }}
-          >
-            learn, automate, and build from a single idea.
-          </Text>
-          <Text
-            mt={26}
-            style={{
-              maxWidth: 820,
-              fontSize: 'clamp(17px, 2vw, 22px)',
-              lineHeight: 1.55,
-              color: theme.colorScheme === 'dark' ? '#cbd5e1' : '#3f4855',
-            }}
-          >
-            For AI agent learners, builders, job seekers, and business owners — Skill Pilot turns AI from a chat tool into an active worker that gets things done on day one.
-          </Text>
-          <Text
-            mt={28}
-            style={{
-              fontSize: 'clamp(20px, 2.4vw, 30px)',
-              lineHeight: 1.25,
-              fontWeight: 800,
-              color: theme.colorScheme === 'dark' ? '#fde68a' : '#8a4b0f',
-            }}
-          >
-            "Software runs. Codeware grows."
+      <div style={{ position: 'absolute', top: 20, right: 20 }}>
+        <Button
+          size="sm"
+          variant="subtle"
+          leftIcon={<IconPlus size="1rem" />}
+          onClick={() => void handleStartShellTerminal()}
+          loading={startingSession}
+          aria-label="New terminal"
+        >
+          Terminal
+        </Button>
+      </div>
+      <Stack spacing="md" style={{ width: '100%', maxWidth: 600 }}>
+        <div>
+          <Text size={36} weight={800} mb={8}>Skill Pilot</Text>
+          <Text size="lg" color="dimmed" italic>
+            Do anything first, then learn anything you want
           </Text>
         </div>
-
-        <Group mt={36} spacing="sm">
-          <Button
-            size="md"
-            rightIcon={<IconArrowRight size="1rem" />}
-            onClick={() => void router.push('/agent-sessions?new=true')}
+        {hasSessionWorktrees && (
+          <Select
+            label="Worktree"
+            placeholder="Choose where to start"
+            value={selectedSessionPath || null}
+            onChange={(value) => setSelectedSessionPath(value || '')}
+            data={sessionRootOptions.map((root) => ({ value: root.value, label: root.label }))}
+          />
+        )}
+        <Textarea
+          placeholder="What would you like to do?"
+          value={promptText}
+          onChange={(e) => setPromptText(e.currentTarget.value)}
+          onKeyDown={handleKeyDown}
+          autosize
+          minRows={3}
+          maxRows={10}
+          size="md"
+        />
+        {!newSessionWorkflow && (
+          <Group spacing="md" grow>
+            <Select
+              label="Model"
+              placeholder="Default model"
+              value={selectedModel}
+              onChange={(value) => setSelectedModel(value || null)}
+              data={(llmProviders.find((p) => p.id === llmProvider)?.models || []).map((m) => ({ value: m, label: m }))}
+              size="sm"
+              clearable
+            />
+            <Select
+              label="Effort"
+              placeholder="Default effort"
+              value={selectedEffort}
+              onChange={(value) => setSelectedEffort(value || null)}
+              data={(llmProviders.find((p) => p.id === llmProvider)?.effort_levels || []).map((e) => ({ value: e, label: e }))}
+              size="sm"
+              clearable
+              disabled={!llmProvider || (llmProviders.find((p) => p.id === llmProvider)?.effort_levels || []).length === 0}
+            />
+          </Group>
+        )}
+        {newSessionWorkflow && (
+          <>
+            <Text size="sm" color="dimmed" align="center">
+              Workflow mode: providers are controlled by the workflow nodes for {`core/workflows/${newSessionWorkflow}`}
+            </Text>
+            <Select
+              label="Next Node Trigger"
+              value={newSessionNextNodeTrigger}
+              onChange={(value) => setNewSessionNextNodeTrigger((value as NextNodeTrigger) || 'auto_continue')}
+              data={[
+                { value: 'auto_continue', label: 'Auto continue' },
+                { value: 'start_by_prompt', label: 'Start by prompt' },
+              ]}
+            />
+          </>
+        )}
+        {workflowExecuteStatus && workflowSessionActive && (
+          <Text
+            size="sm"
+            align="center"
+            color={workflowExecuteStatus.status === 'error' || workflowExecuteStatus.status === 'terminated' ? 'red' : 'dimmed'}
           >
-            Start New Session
-          </Button>
-          <Button
-            size="md"
-            variant="default"
-            onClick={() => void router.push('/agent-sessions')}
+            Workflow status: {workflowExecuteStatus.status}
+            {workflowExecuteStatus.error ? ` - ${workflowExecuteStatus.error}` : ''}
+          </Text>
+        )}
+        {workflowExecuteStatus && !workflowSessionActive && (workflowExecuteStatus.status === 'finished' || workflowExecuteStatus.status === 'error' || workflowExecuteStatus.status === 'terminated') && (
+          <Text
+            size="sm"
+            align="center"
+            color={workflowExecuteStatus.status === 'finished' ? 'green' : 'red'}
           >
-            View Sessions
-          </Button>
+            Workflow {workflowExecuteStatus.status}
+            {workflowExecuteStatus.error ? ` - ${workflowExecuteStatus.error}` : ''}
+          </Text>
+        )}
+        <Group position="center" spacing="lg">
+          <Checkbox
+            label="Sandbox"
+            checked={newSessionSandbox}
+            onChange={(e) => setNewSessionSandbox(e.currentTarget.checked)}
+            size="xs"
+          />
+          <Checkbox
+            label="Auto Run (Yolo)"
+            checked={newSessionAuto}
+            onChange={(e) => setNewSessionAuto(e.currentTarget.checked)}
+            size="xs"
+          />
+          <Checkbox
+            label="Network Access"
+            checked={newSessionNetwork}
+            onChange={(e) => setNewSessionNetwork(e.currentTarget.checked)}
+            size="xs"
+          />
+          <Checkbox
+            label="Native Terminal"
+            checked={newSessionNativeTerminal}
+            onChange={(e) => setNewSessionNativeTerminal(e.currentTarget.checked)}
+            size="xs"
+          />
         </Group>
-      </div>
-
-      <div
-        style={{
-          width: '100%',
-          maxWidth: 1180,
-          margin: '48px auto 0',
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))',
-          gap: 14,
-        }}
-      >
-        {[
-          { label: 'Learn', detail: 'Build skill while doing real work.', href: '/courses', icon: <IconBook2 size={22} /> },
-          { label: 'Automate', detail: 'Turn repeatable tasks into agent workflows.', href: '/tasks', icon: <IconMessages size={22} /> },
-          { label: 'Build', detail: 'Create software and codeware from an idea.', href: '/vibe-coding', icon: <IconRocket size={22} /> },
-          { label: 'Grow', detail: 'Prepare projects, portfolios, and business tools.', href: '/research', icon: <IconBriefcase size={22} /> },
-        ].map((item) => (
-          <button
-            key={item.label}
-            type="button"
-            onClick={() => void router.push(item.href)}
-            style={{
-              minHeight: 132,
-              padding: 18,
-              borderRadius: 8,
-              border: `1px solid ${theme.colorScheme === 'dark' ? 'rgba(148, 163, 184, 0.24)' : 'rgba(31, 41, 55, 0.12)'}`,
-              background: theme.colorScheme === 'dark' ? 'rgba(15, 23, 42, 0.72)' : 'rgba(255, 255, 255, 0.78)',
-              color: 'inherit',
-              textAlign: 'left',
-              cursor: 'pointer',
-              boxShadow: theme.colorScheme === 'dark' ? 'none' : '0 16px 34px rgba(17, 24, 39, 0.07)',
-            }}
-          >
-            <div style={{ color: theme.colors.green[6], marginBottom: 12 }}>{item.icon}</div>
-            <Text size="md" weight={800}>{item.label}</Text>
-            <Text size="sm" color="dimmed" mt={6} style={{ lineHeight: 1.45 }}>{item.detail}</Text>
-          </button>
-        ))}
-      </div>
+        <Group position="center" spacing="md" align="center">
+            <Button size="md" onClick={() => void handleStart()} disabled={!promptText.trim() || startingSession} loading={startingSession}>
+                Start
+            </Button>
+            {newSessionWorkflow && newSessionWorkflowResumeAvailable && (
+              <Checkbox
+                label="Resume Workflow"
+                checked={newSessionWorkflowResume}
+                onChange={(e) => setNewSessionWorkflowResume(e.currentTarget.checked)}
+                size="xs"
+              />
+            )}
+            {workflowSessionActive && workflowExecuteStatus?.waiting_for_continue && (
+              <Button
+                size="md"
+                variant="light"
+                onClick={() => void handleWorkflowContinue()}
+                loading={continuingWorkflow}
+              >
+                Continue Next Node
+              </Button>
+            )}
+        </Group>
+      </Stack>
     </div>
   );
 
@@ -2049,520 +2099,6 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
               wordBreak: 'break-all',
             }}>
               {skillSaveOutput}
-            </pre>
-          )}
-        </div>
-      </div>
-    );
-  };
-
-  const subagentToggle = (name: string) => {
-    setSubagentDisabled((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) {
-        next.delete(name);
-      } else {
-        next.add(name);
-      }
-      return next;
-    });
-  };
-
-  const runSubagentSearch = (value?: string) => {
-    setSubagentAppliedSearch((value ?? subagentSearchText).trim());
-  };
-
-  const subagentSave = async () => {
-    setSubagentSaving(true);
-    setSubagentSaveOutput('');
-    try {
-      const res = await axios.post(`${API_BASE_URL}/config/subagents/update`, {
-        disabled: Array.from(subagentDisabled),
-      });
-      const results = res.data?.results || [];
-      setSubagentSaveOutput(results.map((r: any) => `[${r.command}] exit=${r.exit_code}\n${r.output}`).join('\n---\n'));
-      await fetchSubagents();
-    } catch (err: any) {
-      const results = err?.response?.data?.results || [];
-      const output = results.map((r: any) => `[${r.command}] exit=${r.exit_code}\n${r.output}`).join('\n---\n');
-      setSubagentSaveOutput(output || err?.response?.data?.error || 'Save failed');
-    } finally {
-      setSubagentSaving(false);
-    }
-  };
-
-  const subagentOpenSubScreen = async (mode: 'use' | 'view' | 'edit', subagentName: string, categoryId: string) => {
-    setSubagentSubScreen({ mode, subagentName, categoryId });
-    setSubagentUsePrompt('');
-    setSubagentEditOutput('');
-    if (mode === 'view' || mode === 'edit') {
-      try {
-        const res = await axios.get(`${API_BASE_URL}/config/subagents/${encodeURIComponent(categoryId)}/${encodeURIComponent(subagentName)}/content`);
-        setSubagentContent(res.data?.content || '');
-      } catch {
-        setSubagentContent('Failed to load subagent content.');
-      }
-    }
-  };
-
-  const subagentEditSave = async () => {
-    if (!subagentSubScreen) return;
-    setSubagentEditSaving(true);
-    setSubagentEditOutput('');
-    try {
-      const res = await axios.post(
-        `${API_BASE_URL}/config/subagents/${encodeURIComponent(subagentSubScreen.categoryId)}/${encodeURIComponent(subagentSubScreen.subagentName)}/content`,
-        { content: subagentContent },
-      );
-      const results = res.data?.results || [];
-      setSubagentEditOutput(results.map((r: any) => `[${r.command}] exit=${r.exit_code}\n${r.output}`).join('\n---\n'));
-      await fetchSubagents();
-    } catch (err: any) {
-      const results = err?.response?.data?.results || [];
-      const output = results.map((r: any) => `[${r.command}] exit=${r.exit_code}\n${r.output}`).join('\n---\n');
-      setSubagentEditOutput(output || err?.response?.data?.error || 'Save failed');
-    } finally {
-      setSubagentEditSaving(false);
-    }
-  };
-
-  const subagentUseSubmit = () => {
-    if (!subagentSubScreen) return;
-    const instruction = subagentUsePrompt.trim();
-    if (subagentSubScreen.createSubagent && !instruction) return;
-    const name = subagentSubScreen.subagentName;
-    let prompt: string;
-    if (subagentSubScreen.createSubagent) {
-      prompt = `Create a Skill Pilot subagent using agent skill \`agent-skill\`, as user's requirement below:\n\n${instruction}`;
-    } else {
-      prompt = `Use Skill Pilot subagent: ${name}.`;
-      if (instruction) {
-        prompt += ` User request: ${instruction}`;
-      }
-    }
-    setSubagentSubScreen(null);
-    void router.push({ pathname: '/', query: { new_session: 'true', prompt } });
-  };
-
-  const parseMarkdownParts = (content: string) => {
-    let frontmatter: Record<string, string> = {};
-    let markdownBody = content;
-    if (content.startsWith('---')) {
-      const endIdx = content.indexOf('---', 3);
-      if (endIdx !== -1) {
-        const block = content.slice(3, endIdx);
-        for (const line of block.split('\n')) {
-          const colonIdx = line.indexOf(':');
-          if (colonIdx > 0) {
-            const key = line.slice(0, colonIdx).trim();
-            const val = line.slice(colonIdx + 1).trim();
-            if (key) frontmatter[key] = val;
-          }
-        }
-        markdownBody = content.slice(endIdx + 3).trim();
-      }
-    }
-    return { frontmatter, markdownBody };
-  };
-
-  const renderSubagentsView = () => {
-    if (subagentSubScreen) {
-      const { mode, subagentName } = subagentSubScreen;
-
-      if (mode === 'use') {
-        const isCreate = subagentSubScreen.createSubagent;
-        return (
-          <div style={{ padding: 16, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-            <Group position="apart" mb={16}>
-              <Text size="lg" weight={700}>{isCreate ? 'Create Subagent' : `Use Subagent: ${subagentName}`}</Text>
-              <button
-                type="button"
-                onClick={() => setSubagentSubScreen(null)}
-                style={{
-                  border: `1px solid ${theme.colors.gray[3]}`, borderRadius: 8, padding: '4px 10px',
-                  background: theme.colorScheme === 'dark' ? theme.colors.dark[6] : '#fff', fontSize: 12, cursor: 'pointer',
-                }}
-              >
-                Back
-              </button>
-            </Group>
-            {isCreate && (
-              <Text size="sm" color="dimmed" mb={8}>
-                Describe what this subagent should do, when it should be used, and what output it should return.
-              </Text>
-            )}
-            <textarea
-              placeholder={isCreate
-                ? "Describe the subagent: role, triggers, prompt behavior, output format..."
-                : "Write optional instruction for the AI agent..."}
-              value={subagentUsePrompt}
-              onChange={(e) => setSubagentUsePrompt(e.target.value)}
-              rows={6}
-              style={{
-                width: '100%', padding: '8px 10px', fontSize: 13, borderRadius: 6, fontFamily: 'inherit',
-                border: `1px solid ${theme.colors.gray[3]}`,
-                background: theme.colorScheme === 'dark' ? theme.colors.dark[6] : '#fff',
-                color: 'inherit', resize: 'vertical', marginBottom: 12,
-              }}
-            />
-            <div>
-              <button
-                type="button"
-                onClick={subagentUseSubmit}
-                disabled={isCreate && !subagentUsePrompt.trim()}
-                style={{
-                  padding: '8px 24px', fontSize: 13, fontWeight: 600, borderRadius: 8,
-                  cursor: (isCreate && !subagentUsePrompt.trim()) ? 'not-allowed' : 'pointer',
-                  border: `1px solid ${theme.colors.blue[5]}`, background: theme.colors.blue[6], color: '#fff',
-                  opacity: (isCreate && !subagentUsePrompt.trim()) ? 0.5 : 1,
-                }}
-              >
-                Submit
-              </button>
-            </div>
-          </div>
-        );
-      }
-
-      if (mode === 'view') {
-        const { frontmatter, markdownBody } = parseMarkdownParts(subagentContent);
-        return (
-          <div style={{ padding: 16, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-            <Group position="apart" mb={16}>
-              <Text size="lg" weight={700}>{frontmatter.name || subagentName}</Text>
-              <button
-                type="button"
-                onClick={() => setSubagentSubScreen(null)}
-                style={{
-                  border: `1px solid ${theme.colors.gray[3]}`, borderRadius: 8, padding: '4px 10px',
-                  background: theme.colorScheme === 'dark' ? theme.colors.dark[6] : '#fff', fontSize: 12, cursor: 'pointer',
-                }}
-              >
-                Back
-              </button>
-            </Group>
-
-            <div style={{ flex: 1, overflowY: 'auto', minHeight: 0, paddingBottom: 24 }}>
-              {Object.keys(frontmatter).length > 0 && (
-                <table style={{ width: '100%', maxWidth: 600, marginBottom: 24, borderCollapse: 'collapse', fontSize: 13 }}>
-                  <tbody>
-                    {Object.entries(frontmatter).map(([key, val]) => (
-                      <tr key={key}>
-                        <td style={{
-                          padding: '6px 12px', fontWeight: 600, whiteSpace: 'nowrap',
-                          borderBottom: `1px solid ${theme.colors.gray[2]}`,
-                          color: theme.colorScheme === 'dark' ? theme.colors.gray[4] : theme.colors.gray[7],
-                          width: 140, verticalAlign: 'top',
-                        }}>
-                          {key}
-                        </td>
-                        <td style={{ padding: '6px 12px', borderBottom: `1px solid ${theme.colors.gray[2]}` }}>
-                          {val}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-
-              <div className="prose max-w-none">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownBody}</ReactMarkdown>
-              </div>
-            </div>
-          </div>
-        );
-      }
-
-      if (mode === 'edit') {
-        return (
-          <div style={{ padding: 16, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-            <Group position="apart" mb={16}>
-              <Text size="lg" weight={700}>Edit: {subagentName}</Text>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button
-                  type="button"
-                  onClick={() => void subagentEditSave()}
-                  disabled={subagentEditSaving}
-                  style={{
-                    padding: '4px 14px', fontSize: 12, fontWeight: 600, borderRadius: 8,
-                    cursor: subagentEditSaving ? 'not-allowed' : 'pointer',
-                    border: `1px solid ${theme.colors.blue[5]}`, background: theme.colors.blue[6], color: '#fff',
-                  }}
-                >
-                  {subagentEditSaving ? 'Saving...' : 'Save'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSubagentSubScreen(null)}
-                  style={{
-                    border: `1px solid ${theme.colors.gray[3]}`, borderRadius: 8, padding: '4px 10px',
-                    background: theme.colorScheme === 'dark' ? theme.colors.dark[6] : '#fff', fontSize: 12, cursor: 'pointer',
-                  }}
-                >
-                  Back
-                </button>
-              </div>
-            </Group>
-            <textarea
-              value={subagentContent}
-              onChange={(e) => setSubagentContent(e.target.value)}
-              style={{
-                flex: 1, width: '100%', padding: '8px 10px', fontSize: 13, borderRadius: 6,
-                fontFamily: 'monospace', lineHeight: 1.5,
-                border: `1px solid ${theme.colors.gray[3]}`,
-                background: theme.colorScheme === 'dark' ? theme.colors.dark[6] : '#fff',
-                color: 'inherit', resize: 'none',
-              }}
-            />
-            {subagentEditOutput && (
-              <pre style={{
-                marginTop: 12, fontSize: 11, padding: 10, borderRadius: 6,
-                maxHeight: 200, overflowY: 'auto', flexShrink: 0,
-                background: theme.colorScheme === 'dark' ? theme.colors.dark[8] : theme.colors.gray[1],
-                border: `1px solid ${theme.colors.gray[3]}`, whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-              }}>
-                {subagentEditOutput}
-              </pre>
-            )}
-          </div>
-        );
-      }
-    }
-
-    const subagentTabs = [
-      { id: 'all', label: 'All', subagents: subagentCategories.flatMap((cat) => cat.subagents.map((subagent) => ({ ...subagent, categoryId: cat.id }))) },
-      ...subagentCategories.map((cat) => ({
-        id: cat.id,
-        label: cat.label,
-        subagents: cat.subagents.map((subagent) => ({ ...subagent, categoryId: cat.id })),
-      })),
-    ];
-    const activeTab = subagentTabs.find((tab) => tab.id === subagentActiveTab) || subagentTabs[0];
-    const normalizedSubagentSearch = subagentSearchText.trim().toLowerCase();
-    const subagentSuggestions = normalizedSubagentSearch
-      ? activeTab.subagents.filter((subagent) => (
-        subagent.name.toLowerCase().includes(normalizedSubagentSearch) ||
-        subagent.description.toLowerCase().includes(normalizedSubagentSearch)
-      ))
-      : activeTab.subagents;
-    const normalizedAppliedSearch = subagentAppliedSearch.trim().toLowerCase();
-    const displayedSubagents = normalizedAppliedSearch
-      ? activeTab.subagents.filter((subagent) => (
-        subagent.name.toLowerCase().includes(normalizedAppliedSearch) ||
-        subagent.description.toLowerCase().includes(normalizedAppliedSearch)
-      ))
-      : activeTab.subagents;
-
-    return (
-      <div style={{ padding: 16, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-        <Group position="apart" mb={12}>
-          <Text size="lg" weight={700}>Subagents</Text>
-          <button
-            type="button"
-            onClick={() => {
-              setSubagentSubScreen({ mode: 'use', subagentName: 'agent-skill', categoryId: 'user', createSubagent: true });
-              setSubagentUsePrompt('');
-            }}
-            style={{
-              padding: '5px 14px', fontSize: 12, fontWeight: 600, borderRadius: 8, cursor: 'pointer',
-              border: `1px solid ${theme.colors.blue[5]}`, background: theme.colors.blue[6], color: '#fff',
-            }}
-          >
-            Create Subagent
-          </button>
-        </Group>
-
-        <div style={{ display: 'flex', gap: 0, borderBottom: `2px solid ${theme.colors.gray[3]}`, marginBottom: 16 }}>
-          {subagentTabs.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setSubagentActiveTab(tab.id)}
-              style={{
-                padding: '8px 16px',
-                fontSize: 13,
-                fontWeight: subagentActiveTab === tab.id ? 700 : 400,
-                cursor: 'pointer',
-                border: 'none',
-                borderBottom: subagentActiveTab === tab.id ? `2px solid ${theme.colors.blue[6]}` : '2px solid transparent',
-                marginBottom: -2,
-                background: 'transparent',
-                color: subagentActiveTab === tab.id ? theme.colors.blue[6] : 'inherit',
-              }}
-            >
-              {tab.label} ({tab.subagents.length})
-            </button>
-          ))}
-        </div>
-
-        <div style={{ position: 'relative', marginBottom: 16 }}>
-          <div style={{ display: 'flex', gap: 8 }}>
-            <input
-              type="text"
-              value={subagentSearchText}
-              onChange={(e) => setSubagentSearchText(e.target.value)}
-              onFocus={() => setSubagentSearchFocused(true)}
-              onBlur={() => setTimeout(() => setSubagentSearchFocused(false), 150)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  runSubagentSearch();
-                }
-              }}
-              placeholder={`Search ${activeTab.label.toLowerCase()} subagents...`}
-              style={{
-                flex: 1,
-                padding: '8px 10px',
-                fontSize: 13,
-                borderRadius: 8,
-                border: `1px solid ${theme.colors.gray[3]}`,
-                background: theme.colorScheme === 'dark' ? theme.colors.dark[6] : '#fff',
-                color: 'inherit',
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => runSubagentSearch()}
-              style={{
-                padding: '8px 16px',
-                fontSize: 12,
-                fontWeight: 600,
-                borderRadius: 8,
-                cursor: 'pointer',
-                border: `1px solid ${theme.colors.blue[5]}`,
-                background: theme.colors.blue[6],
-                color: '#fff',
-              }}
-            >
-              Search
-            </button>
-          </div>
-          {subagentSearchFocused && subagentSuggestions.length > 0 && (
-            <div style={{
-              position: 'absolute',
-              top: '100%',
-              left: 0,
-              right: 88,
-              zIndex: 10,
-              maxHeight: 220,
-              overflowY: 'auto',
-              borderRadius: 8,
-              marginTop: 4,
-              border: `1px solid ${theme.colors.gray[3]}`,
-              background: theme.colorScheme === 'dark' ? theme.colors.dark[6] : '#fff',
-              boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-            }}>
-              {subagentSuggestions.slice(0, 12).map((subagent) => (
-                <div
-                  key={`${subagent.categoryId}:${subagent.name}`}
-                  onMouseDown={() => {
-                    setSubagentSearchText(subagent.name);
-                    runSubagentSearch(subagent.name);
-                  }}
-                  style={{
-                    padding: '8px 10px',
-                    cursor: 'pointer',
-                    borderBottom: `1px solid ${theme.colors.gray[2]}`,
-                  }}
-                >
-                  <Text size="sm" weight={600}>{subagent.name}</Text>
-                  <Text size="xs" color="dimmed" lineClamp={1}>{subagent.description}</Text>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        <div style={{ flex: 1, overflowY: 'auto', minHeight: 0 }}>
-          {activeTab.subagents.length === 0 && (
-            <Text size="sm" color="dimmed">No subagents in this category.</Text>
-          )}
-
-          {activeTab.subagents.length > 0 && displayedSubagents.length === 0 && (
-            <Text size="sm" color="dimmed">No subagents match this search in the current category.</Text>
-          )}
-
-          {displayedSubagents.map((subagent) => (
-            <div
-              key={`${subagent.categoryId}:${subagent.name}`}
-              style={{
-                border: `1px solid ${theme.colors.gray[3]}`,
-                borderRadius: 8,
-                padding: '8px 12px',
-                marginBottom: 6,
-                background: theme.colorScheme === 'dark' ? theme.colors.dark[7] : '#fff',
-                opacity: subagentDisabled.has(subagent.name) ? 0.5 : 1,
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <Text size="sm" weight={600}>{subagent.name}</Text>
-                  <Text size="xs" color="dimmed" lineClamp={2}>{subagent.description}</Text>
-                  <Text size="xs" color="dimmed">{subagent.fileName}</Text>
-                </div>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', marginLeft: 12, flexShrink: 0 }}>
-                  <input
-                    type="checkbox"
-                    checked={!subagentDisabled.has(subagent.name)}
-                    onChange={() => subagentToggle(subagent.name)}
-                    style={{ width: 16, height: 16, cursor: 'pointer' }}
-                  />
-                  <Text size="xs">{subagentDisabled.has(subagent.name) ? 'Disabled' : 'Enabled'}</Text>
-                </label>
-              </div>
-              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                {(['Use', 'View', 'Edit'] as const).map((action) => (
-                  <button
-                    key={action}
-                    type="button"
-                    onClick={() => void subagentOpenSubScreen(action.toLowerCase() as 'use' | 'view' | 'edit', subagent.name, subagent.categoryId)}
-                    style={{
-                      padding: '5px 14px', fontSize: 12, fontWeight: 500, borderRadius: 6, cursor: 'pointer',
-                      border: `1px solid ${theme.colors.gray[4]}`,
-                      background: theme.colorScheme === 'dark' ? theme.colors.dark[5] : theme.colors.gray[0],
-                      color: 'inherit',
-                    }}
-                  >
-                    {action}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div style={{ marginTop: 12, borderTop: `1px solid ${theme.colors.gray[3]}`, paddingTop: 12, flexShrink: 0 }}>
-          <button
-            type="button"
-            onClick={() => void subagentSave()}
-            disabled={subagentSaving}
-            style={{
-              padding: '8px 24px',
-              fontSize: 13,
-              fontWeight: 600,
-              borderRadius: 8,
-              cursor: subagentSaving ? 'not-allowed' : 'pointer',
-              border: `1px solid ${theme.colors.blue[5]}`,
-              background: theme.colors.blue[6],
-              color: '#fff',
-            }}
-          >
-            {subagentSaving ? 'Saving...' : 'Save & Update'}
-          </button>
-          {subagentSaveOutput && (
-            <pre style={{
-              marginTop: 12,
-              fontSize: 11,
-              padding: 10,
-              borderRadius: 6,
-              maxHeight: 200,
-              overflowY: 'auto',
-              background: theme.colorScheme === 'dark' ? theme.colors.dark[8] : theme.colors.gray[1],
-              border: `1px solid ${theme.colors.gray[3]}`,
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-all',
-            }}>
-              {subagentSaveOutput}
             </pre>
           )}
         </div>
@@ -3876,11 +3412,11 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
                 ))}
               </div>
               <div>
-                <Text size="xs" weight={600} color="dimmed" mb={4}>Agent CLI</Text>
+                <Text size="xs" weight={600} color="dimmed" mb={4}>Skill Agent</Text>
                 <Group spacing="md">
                   {flagLabels.map((f) => (
                     <Checkbox
-                      key={`agent-cli-${provider.id}-${f.key}`}
+                      key={`skill-agent-${provider.id}-${f.key}`}
                       label={f.label}
                       checked={getSkillAgentFlags(provider.id)[f.key]}
                       onChange={(e) => updateSkillAgent(provider.id, f.key, e.currentTarget.checked)}
@@ -4189,6 +3725,8 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
 
   const renderMainContent = () => {
     switch (activeView) {
+      case 'explore':
+        return <ExploreView />;
       case 'home':
         return renderHomeView();
       case 'live-terminal':
@@ -4211,8 +3749,6 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
         return renderDiscordBotView();
       case 'skills':
         return renderSkillsView();
-      case 'subagents':
-        return renderSubagentsView();
       case 'mcp-servers':
         return renderMcpServersView();
       case 'schedule':
@@ -4224,7 +3760,7 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
       case 'profile':
         return renderProfileView();
       default:
-        return renderHomeView();
+        return <ExploreView />;
     }
   };
 
@@ -4282,6 +3818,9 @@ export default function HomePage({ initialView = 'home' }: HomePageProps) {
                   if (!value) return;
                   setLlmProvider(value);
                   setSelectedProvider(value);
+                  const provider = llmProviders.find((p) => p.id === value);
+                  setSelectedModel(provider?.models?.[0] || null);
+                  setSelectedEffort(null);
                 }}
                 data={llmProviders.map((p) => ({ value: p.id, label: p.name }))}
                 size="xs"

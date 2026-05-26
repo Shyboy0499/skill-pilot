@@ -1,9 +1,6 @@
 from routes_shared import *
 
 import yaml
-import zipfile
-from typing import Set
-from fastapi import HTTPException
 import routes_config  # noqa: F401
 import routes_codeware  # noqa: F401
 import routes_integrations  # noqa: F401
@@ -22,42 +19,11 @@ from routes_file_manager import (
     files_upload,
     files_write,
 )
-from agent_sessions import list_agent_session_categories, read_agent_session_payload
 
 _REPO_ROOT_RESOLVED = _REPO_ROOT.resolve()
 _DEV_WEBUI_SESSION_NAME = "sp-webui-dev"
 _DEV_ENGINE_SESSION_NAME = "sp-engine-dev"
 _EXPLORE_DEV_START_GRACE_SECONDS = 20.0
-
-
-def _coerce_terminal_env(raw_env: Any) -> Dict[str, str]:
-    if raw_env in (None, "", []):
-        return {}
-    values: Dict[str, str] = {}
-    if isinstance(raw_env, dict):
-        items = raw_env.items()
-    elif isinstance(raw_env, list):
-        items = []
-        for entry in raw_env:
-            if isinstance(entry, dict):
-                key = entry.get("key", entry.get("name"))
-                value = entry.get("value", "")
-                items.append((key, value))
-            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                items.append((entry[0], entry[1]))
-            else:
-                raise ValueError("env entries must be key/value pairs")
-    else:
-        raise ValueError("env must be an object or key/value array")
-
-    for key, value in items:
-        env_key = str(key or "").strip()
-        if not env_key:
-            continue
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key):
-            raise ValueError(f"invalid env key: {env_key}")
-        values[env_key] = str(value)
-    return values
 
 
 @router.get("/api/health")
@@ -154,11 +120,12 @@ def terminal_tmux_create(payload: Dict[str, Any]):
     sandbox = payload.get("sandbox")
     auto = payload.get("auto")
     network = payload.get("network")
+    model = (str(payload.get("model") or "")).strip() or None
+    effort = (str(payload.get("effort") or "")).strip() or None
     requested_start_path = payload.get("path")
     requested_path_mode = (str(payload.get("path_mode") or "").strip().lower() or None)
 
     try:
-        extra_env = _coerce_terminal_env(payload.get("env"))
         start_dir = _resolve_terminal_start_dir(requested_start_path, path_mode=requested_path_mode)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -170,7 +137,8 @@ def terminal_tmux_create(payload: Dict[str, Any]):
             sandbox=sandbox,
             auto=auto,
             network=network,
-            extra_env=extra_env,
+            model=model,
+            effort=effort,
         )
         logger.info("[tmux-create] provider=%s command=%s", provider.get("id"), command)
     else:
@@ -250,7 +218,7 @@ def terminal_tmux_kill(payload: Dict[str, Any]):
         session_name = _validate_tmux_session_name_any(raw_session)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
-    if _is_protected_tmux_session(session_name) and not session_name.startswith(FILE_MANAGER_TERMINAL_SESSION_PREFIX):
+    if _is_protected_tmux_session(session_name):
         return JSONResponse(status_code=403, content={"error": f"tmux session '{session_name}' is protected"})
     try:
         removed = _kill_tmux_session_with_history(session_name)
@@ -291,27 +259,6 @@ def terminal_tmux_saved_history(id: str):
     except OSError as exc:
         return JSONResponse(status_code=500, content={"error": str(exc)})
     return history
-
-
-@router.get("/api/agent-sessions")
-def agent_sessions():
-    try:
-        categories = list_agent_session_categories()
-    except OSError as exc:
-        return JSONResponse(status_code=500, content={"error": str(exc), "categories": []})
-    return {"categories": categories}
-
-
-@router.get("/api/agent-sessions/session")
-def agent_session(id: str):
-    try:
-        return read_agent_session_payload(id)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc)})
-    except FileNotFoundError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-    except OSError as exc:
-        return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
 @router.delete("/api/terminal/tmux/saved-history")
@@ -485,7 +432,6 @@ async def terminal_ws(
         return
     user_input_event = asyncio.Event()
     output_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-    cleanup_tmux_on_close = True
 
     async def reader() -> None:
         try:
@@ -541,7 +487,6 @@ async def terminal_ws(
                 await flush()
 
     async def receiver() -> None:
-        nonlocal cleanup_tmux_on_close
         while True:
             message = await websocket.receive_text()
             try:
@@ -565,9 +510,6 @@ async def terminal_ws(
                     user_input_event.set()
                 continue
             if event_type == "close":
-                break
-            if event_type == "detach":
-                cleanup_tmux_on_close = False
                 break
 
     reader_task = asyncio.create_task(reader())
@@ -602,7 +544,7 @@ async def terminal_ws(
             await websocket.close()
         except RuntimeError:
             pass
-        if cleanup_tmux_on_close and session_name and session_name.startswith(TMUX_SESSION_PREFIX):
+        if session_name and session_name.startswith(TMUX_SESSION_PREFIX):
             try:
                 removed = _cleanup_webui_tmux_session(session_name)
                 if removed:
@@ -735,7 +677,8 @@ def _normalize_vibe_project_name(value: str) -> str:
     return _normalize_task_slug(value, default="project")
 
 
-VIBE_CODING_ARCHIVE_DIR = "design-archive"
+VIBE_CODING_DESIGN_DOCS_DIR = "design-docs"
+VIBE_CODING_ARCHIVE_DIR = "archive"
 VIBE_CODING_ASSETS_DIR = "assets"
 VIBE_CODING_ICON_FILE = "icon.png"
 VIBE_CODING_INFO_FILE = "info.yaml"
@@ -762,7 +705,10 @@ def _ensure_vibe_project_file(project_name: str, file_name: str) -> tuple[Path, 
         raise ValueError("Project name is required")
     project_dir = VIBE_CODING_DIR / normalized_project
     project_dir.mkdir(parents=True, exist_ok=True)
-    file_path = project_dir / file_name
+    design_docs_dir = project_dir / VIBE_CODING_DESIGN_DOCS_DIR
+    design_docs_dir.mkdir(parents=True, exist_ok=True)
+    (design_docs_dir / VIBE_CODING_ARCHIVE_DIR).mkdir(parents=True, exist_ok=True)
+    file_path = design_docs_dir / file_name
     return project_dir, file_path, normalized_project
 
 
@@ -782,8 +728,9 @@ def _is_vibe_project_requirements_file(file_path: Path) -> bool:
     except ValueError:
         return False
     return (
-        len(relative_parts) == 2
-        and relative_parts[1] == "requirements.md"
+        len(relative_parts) == 3
+        and relative_parts[1] == VIBE_CODING_DESIGN_DOCS_DIR
+        and relative_parts[2] == "requirements.md"
     )
 
 
@@ -852,27 +799,6 @@ def _safe_research_path(task_path: str, *, must_exist: bool = True) -> Path:
         raise ValueError("Invalid research path")
     if must_exist and (not candidate.exists() or not candidate.is_file()):
         raise FileNotFoundError("Research file not found")
-    return candidate
-
-
-def _safe_research_static_path(project: str, file_path: str = "") -> Path:
-    project_name = str(project or "").strip().replace("\\", "/").strip("/")
-    if not project_name or "/" in project_name or project_name in {".", ".."}:
-        raise ValueError("Invalid research project")
-    project_dir = (RESEARCH_DIR / project_name).resolve()
-    if project_dir != RESEARCH_DIR and RESEARCH_DIR not in project_dir.parents:
-        raise ValueError("Invalid research project")
-    if not project_dir.exists() or not project_dir.is_dir():
-        raise FileNotFoundError("Research project not found")
-
-    relative_file = str(file_path or "index.html").strip().replace("\\", "/").lstrip("/")
-    if not relative_file:
-        relative_file = "index.html"
-    candidate = (project_dir / relative_file).resolve()
-    if candidate != project_dir and project_dir not in candidate.parents:
-        raise ValueError("Invalid research static path")
-    if not candidate.exists() or not candidate.is_file():
-        raise FileNotFoundError("Research static file not found")
     return candidate
 
 
@@ -1048,27 +974,6 @@ def _resolve_showcase_skill_path(name: str) -> str | None:
     return None
 
 
-def _resolve_showcase_subagent_path(name: str) -> str | None:
-    value = str(name or "").strip().strip("/")
-    if not value:
-        return None
-
-    direct = (_REPO_ROOT / value).resolve()
-    if direct.is_file() and direct.suffix.lower() == ".md":
-        rel = _repo_relative_if_inside(direct)
-        if rel and rel.startswith("core/subagents/"):
-            return rel
-
-    subagent_name = value.split("/")[-1]
-    if subagent_name.endswith(".md"):
-        subagent_name = subagent_name[:-3]
-    for parent in (_REPO_ROOT / "core" / "subagents").glob("*"):
-        candidate = parent / f"{subagent_name}.md"
-        if candidate.is_file():
-            return candidate.relative_to(_REPO_ROOT).as_posix()
-    return None
-
-
 _SHOWCASE_TEXT_EXTENSIONS = {
     ".bash",
     ".cjs",
@@ -1127,55 +1032,6 @@ def _showcase_item(label: str, path: str | None = None) -> Dict[str, str | None]
     return {"label": label, "path": path}
 
 
-def _load_showcase_term_urls() -> Dict[str, str]:
-    terms_path = _REPO_ROOT / "core" / "engine" / "data" / "terms.json"
-    if not terms_path.is_file():
-        return {}
-    try:
-        raw = json.loads(terms_path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.warning("failed to load showcase terms data from %s", terms_path)
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {str(key): str(value).strip() for key, value in raw.items() if str(value).strip()}
-
-
-def _showcase_term_slug(term: str) -> str:
-    return re.sub(r"\s+", "-", re.sub(r"[^a-z0-9\s-]", "", term.lower()).strip())
-
-
-def _extract_showcase_prompt_refs(prompt: str) -> List[str]:
-    refs: List[str] = []
-    seen: Set[str] = set()
-    for match in re.finditer(r"@([A-Za-z0-9_./-]+)", prompt or ""):
-        ref = match.group(1).strip().rstrip(".,;:!?").lstrip("/")
-        if ref and ref not in seen:
-            seen.add(ref)
-            refs.append(ref)
-    return refs
-
-
-def _resolve_showcase_prompt_ref(ref: str, sample_id: str, directory: str | None, files: List[str]) -> str | None:
-    direct = _resolve_showcase_text_path(ref)
-    if direct:
-        return direct
-
-    if not directory:
-        return None
-    normalized_ref = str(ref or "").strip().lstrip("/")
-    normalized_dir = directory.strip().strip("/")
-    if not normalized_ref.startswith(f"{normalized_dir}/"):
-        return None
-    file_ref = normalized_ref[len(normalized_dir) + 1:]
-    for file_path in files:
-        normalized_file = file_path.strip().lstrip("/")
-        if normalized_file == file_ref:
-            packaged = f"workspace/showcases/{sample_id}/{normalized_file}"
-            return _resolve_showcase_text_path(packaged)
-    return None
-
-
 def _normalize_showcase_related(item: Any) -> Dict[str, str]:
     if not isinstance(item, dict):
         raise ValueError("Showcase related entries must be objects")
@@ -1196,18 +1052,6 @@ def _normalize_showcase_variant(item: Any) -> Dict[str, str]:
     return {"slug": slug, "caption": caption}
 
 
-def _normalize_showcase_sequence_link(item: Any, field_name: str) -> Dict[str, str] | None:
-    if item in (None, ""):
-        return None
-    if not isinstance(item, dict):
-        raise ValueError(f"Showcase {field_name} must be an object")
-    slug_id = str(item.get("slug_id") or "").strip()
-    title = str(item.get("title") or "").strip()
-    if not slug_id or not title:
-        raise ValueError(f"Showcase {field_name} requires slug_id and title")
-    return {"slug_id": slug_id, "title": title}
-
-
 def _normalize_showcase_repo_paths(items: Any) -> List[str]:
     if items in (None, ""):
         return []
@@ -1217,44 +1061,6 @@ def _normalize_showcase_repo_paths(items: Any) -> List[str]:
     for item in items:
         values.append(_normalize_repo_relative_path(item))
     return values
-
-
-_DEFAULT_SHOWCASE_SYSTEM_SKILLS = ["do-and-learn"]
-
-
-def _normalize_showcase_system_skills(sample: Dict[str, Any]) -> List[str]:
-    items = sample.get("system_skills", _DEFAULT_SHOWCASE_SYSTEM_SKILLS)
-    if items in (None, ""):
-        return []
-    if not isinstance(items, list):
-        raise ValueError("Showcase system_skills must be an array")
-    values: List[str] = []
-    for item in items:
-        name = str(item or "").strip().strip("/")
-        if name:
-            values.append(name)
-    return values
-
-
-def _showcase_skill_match_keys(value: str) -> Set[str]:
-    normalized = str(value or "").strip().strip("/")
-    if not normalized:
-        return set()
-    last_segment = normalized.split("/")[-1]
-    return {normalized, last_segment}
-
-
-def _filter_visible_showcase_skills(skills: List[str], system_skills: List[str]) -> List[str]:
-    hidden_keys: Set[str] = set()
-    for skill in system_skills:
-        hidden_keys.update(_showcase_skill_match_keys(skill))
-    if not hidden_keys:
-        return skills
-    return [
-        skill
-        for skill in skills
-        if _showcase_skill_match_keys(skill).isdisjoint(hidden_keys)
-    ]
 
 
 def _normalize_showcase_extensions(items: Any) -> List[str]:
@@ -1298,37 +1104,24 @@ def _normalize_showcase_sample(sample: Any, category_name: str) -> Dict[str, Any
     in_mode = _normalize_showcase_in_mode(sample.get("in_mode"))
     workflow = str(sample.get("workflow") or "").strip() or None
     directory = str(sample.get("directory") or "").strip() or None
-    zip_files_url = str(sample.get("zip-files-url") or "").strip() or None
     use_worktree = _bool_with_default(sample.get("use_worktree"), False)
 
-    system_skills = _normalize_showcase_system_skills(sample)
-    skills = _filter_visible_showcase_skills(_normalize_showcase_repo_paths(sample.get("skills")), system_skills)
-    subagents = _normalize_showcase_repo_paths(sample.get("subagents"))
+    skills = _normalize_showcase_repo_paths(sample.get("skills"))
     tools = _normalize_showcase_repo_paths(sample.get("tools"))
     files = _normalize_showcase_repo_paths(sample.get("files"))
     skill_items = [_showcase_item(skill, _resolve_showcase_skill_path(skill)) for skill in skills]
-    subagent_items = [_showcase_item(subagent, _resolve_showcase_subagent_path(subagent)) for subagent in subagents]
     tool_items = [_showcase_item(tool, _resolve_showcase_text_path(tool)) for tool in tools]
     file_items = [_showcase_item(file_path, _resolve_showcase_text_path(file_path)) for file_path in files]
-    prompt_items = [_showcase_item(ref, _resolve_showcase_prompt_ref(ref, sample_id, directory, files)) for ref in _extract_showcase_prompt_refs(prompt)]
     extensions = _normalize_showcase_extensions(sample.get("extensions"))
     links = [_normalize_showcase_link(item) for item in (sample.get("links") or [])]
     related = [_normalize_showcase_related(item) for item in (sample.get("related") or [])]
     variants = [_normalize_showcase_variant(item) for item in (sample.get("variants") or [])]
-    previous_showcase = _normalize_showcase_sequence_link(sample.get("previous_showcase"), "previous_showcase")
-    next_showcase = _normalize_showcase_sequence_link(sample.get("next_showcase"), "next_showcase")
 
     goals = str(sample.get("goals") or "").strip() or None
     terms_raw = sample.get("terms")
     terms: List[str] = []
     if isinstance(terms_raw, list):
         terms = [str(t).strip() for t in terms_raw if str(t).strip()]
-    term_url_lookup = _load_showcase_term_urls()
-    term_urls = {
-        term: term_url_lookup[_showcase_term_slug(term)]
-        for term in terms
-        if term_url_lookup.get(_showcase_term_slug(term))
-    }
 
     try:
         popularity = int(sample.get("popularity", 0))
@@ -1362,29 +1155,21 @@ def _normalize_showcase_sample(sample: Any, category_name: str) -> Dict[str, Any
         "prompt": prompt,
         "workflow": workflow,
         "directory": directory,
-        "zip-files-url": zip_files_url,
         "in_mode": in_mode,
         "git_tag": git_tag,
         "use_worktree": use_worktree,
-        "system_skills": system_skills,
         "skills": skills,
         "skill_items": skill_items,
-        "subagents": subagents,
-        "subagent_items": subagent_items,
         "extensions": extensions,
         "tools": tools,
         "tool_items": tool_items,
         "files": files,
         "file_items": file_items,
-        "prompt_items": prompt_items,
         "links": links,
         "related": related,
         "variants": variants,
-        "previous_showcase": previous_showcase,
-        "next_showcase": next_showcase,
         "goals": goals,
         "terms": terms,
-        "term_urls": term_urls,
         "popularity": popularity,
         "level": level,
         "rate": rate,
@@ -1444,27 +1229,6 @@ def _validate_showcase_reference_targets(categories: List[Dict[str, Any]], field
                 raise ValueError(f"Showcase sample '{sample_id}' has unknown {field_name} slug '{slug}'")
 
 
-def _validate_showcase_sequence_targets(categories: List[Dict[str, Any]]) -> None:
-    samples: List[Dict[str, Any]] = []
-
-    def collect(cat_list: List[Dict[str, Any]]) -> None:
-        for category in cat_list:
-            samples.extend(category.get("samples", []))
-            collect(category.get("subcategories") or [])
-
-    collect(categories)
-    sample_ids = {str(sample.get("id") or "") for sample in samples}
-    for sample in samples:
-        sample_id = str(sample.get("id") or "")
-        for field_name in ("previous_showcase", "next_showcase"):
-            item = sample.get(field_name)
-            if not item:
-                continue
-            slug_id = str(item.get("slug_id") or "")
-            if slug_id not in sample_ids:
-                raise ValueError(f"Showcase sample '{sample_id}' has unknown {field_name} slug_id '{slug_id}'")
-
-
 def _load_showcases() -> List[Dict[str, Any]]:
     if not _SHOWCASES_PATH.is_file():
         raise FileNotFoundError(f"Showcases file not found: {_SHOWCASES_PATH}")
@@ -1501,7 +1265,6 @@ def _load_showcases() -> List[Dict[str, Any]]:
     categories = [_normalize_showcase_category(cat) for cat in raw]
     _validate_showcase_reference_targets(categories, "related")
     _validate_showcase_reference_targets(categories, "variants")
-    _validate_showcase_sequence_targets(categories)
     return categories
 
 
@@ -1720,153 +1483,12 @@ def _ensure_explore_worktree(path: Path, *, sample_id: str, existing_action: str
     return None
 
 
-def _safe_template_directory(root: Path, raw_directory: str | None) -> Path | None:
-    value = str(raw_directory or "").strip()
-    if not value:
-        return None
-    candidate = Path(value)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        raise ValueError(f"Invalid showcase directory: {value}")
-    root_resolved = root.resolve()
-    target = (root_resolved / candidate).resolve()
-    try:
-        target.relative_to(root_resolved)
-    except ValueError as exc:
-        raise ValueError(f"Showcase directory escapes the project root: {value}") from exc
-    return target
-
-
-def _validate_template_zip_url(raw_url: str | None) -> str | None:
-    value = str(raw_url or "").strip()
-    if not value:
-        return None
-    parsed = urllib.parse.urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("Showcase zip-files-url must be an HTTP(S) URL")
-    return value
-
-
-def _download_template_zip(url: str, destination: Path, *, max_bytes: int = 500 * 1024 * 1024) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(url, headers={"Accept": "application/zip,application/octet-stream,*/*"})
-    total = 0
-    with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as handle:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError("Showcase zip file is too large")
-            handle.write(chunk)
-
-
-_SHOWCASE_TEMPLATE_INTERNAL_FILES = {"files.yaml", "showcase.yaml"}
-
-
-def _safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
-    extract_root = extract_dir.resolve()
-    with zipfile.ZipFile(zip_path) as archive:
-        for info in archive.infolist():
-            name = info.filename
-            path = Path(name)
-            if path.is_absolute() or ".." in path.parts:
-                raise ValueError(f"Unsafe path in showcase zip: {name}")
-            target = (extract_root / path).resolve()
-            try:
-                target.relative_to(extract_root)
-            except ValueError as exc:
-                raise ValueError(f"Unsafe path in showcase zip: {name}") from exc
-            if path.name in _SHOWCASE_TEMPLATE_INTERNAL_FILES:
-                continue
-            if target.exists():
-                continue
-            if info.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as source, target.open("wb") as destination:
-                shutil.copyfileobj(source, destination)
-
-
-def _move_template_files(extract_dir: Path, target_dir: Path) -> None:
-    target_dir.parent.mkdir(parents=True, exist_ok=True)
-    target_dir.mkdir()
-    for child in extract_dir.iterdir():
-        target = target_dir / child.name
-        if target.exists():
-            continue
-        shutil.move(str(child), str(target))
-
-
-def _prepare_showcase_template_files(sample: Dict[str, Any], target_root: Path) -> Dict[str, Any]:
-    target_dir = _safe_template_directory(target_root, sample.get("directory"))
-    if target_dir is None:
-        return {"status": "skipped", "reason": "no_directory"}
-    if target_dir.exists():
-        return {"status": "skipped", "reason": "directory_exists", "directory": str(target_dir)}
-
-    zip_url = _validate_template_zip_url(sample.get("zip-files-url"))
-    if not zip_url:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return {"status": "created_directory", "directory": str(target_dir)}
-
-    temp_root = target_root.resolve() / ".skillpilot" / "temp" / "explore-templates"
-    run_dir = temp_root / f"{sample.get('id') or 'showcase'}-{uuid4().hex}"
-    zip_path = run_dir / "template.zip"
-    extract_dir = run_dir / "extracted"
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        _download_template_zip(zip_url, zip_path)
-        _safe_extract_zip(zip_path, extract_dir)
-        _move_template_files(extract_dir, target_dir)
-    finally:
-        shutil.rmtree(run_dir, ignore_errors=True)
-    return {"status": "extracted_zip", "directory": str(target_dir), "zip_url": zip_url}
-
-
-def _showcase_session_directory(sample: Dict[str, Any], target_root: Path) -> str | None:
-    target_dir = _safe_template_directory(target_root, sample.get("directory"))
-    if target_dir is None:
-        return None
-    return str(target_dir)
-
-
-def _file_manager_path_for_directory(directory: str | None) -> str | None:
-    if not directory:
-        return None
-    try:
-        normalized = routes_file_manager._normalize_files_repo_path(Path(directory))
-    except Exception:
-        return None
-    return normalized
-
-
-def _build_prompt_target_url(
-    base_url: str,
-    prompt: str,
-    path: str | None = None,
-    showcase_directory: str | None = None,
-    system_skills: List[str] | None = None,
-    showcase_id: str | None = None,
-) -> str:
-    params = [
-        ("new", "true"),
-        ("prompt", prompt),
-    ]
+def _build_prompt_target_url(base_url: str, prompt: str, path: str | None = None) -> str:
+    encoded_prompt = quote(prompt, safe="")
     if path:
-        params.append(("path", path))
-    if showcase_directory:
-        params.append(("showcaseDirectory", showcase_directory))
-        file_manager_path = _file_manager_path_for_directory(showcase_directory)
-        if file_manager_path:
-            params.append(("fileManagerPath", file_manager_path))
-    if showcase_id:
-        params.append(("showcaseSlug", showcase_id))
-    if system_skills:
-        params.append(("systemSkills", json.dumps(system_skills)))
-    query = "&".join(f"{quote(key, safe='')}={quote(str(value), safe='')}" for key, value in params)
-    return f"{base_url}/agent-sessions?{query}"
+        encoded_path = quote(path, safe="")
+        return f"{base_url}/?new_session=true&prompt={encoded_prompt}&path={encoded_path}"
+    return f"{base_url}/?new_session=true&prompt={encoded_prompt}"
 
 
 def _stop_managed_explore_dev_if_running() -> None:
@@ -1919,13 +1541,10 @@ def explore_template_start(payload: Dict[str, Any]):
         return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
 
     prompt = str(sample.get("prompt") or "")
-    system_skills = _normalize_showcase_system_skills(sample)
     sample_in_mode = _normalize_showcase_in_mode(sample.get("in_mode"))
     runtime_mode = get_runtime_mode()
     current_runtime_root = _REPO_ROOT.resolve()
     dev_runtime_target_root = current_runtime_root
-    sample_use_worktree = _bool_with_default(sample.get("use_worktree"), False)
-    use_worktree = use_worktree or sample_use_worktree
     if runtime_mode == "development":
         use_worktree = False
         checkout_tag = False
@@ -1937,12 +1556,6 @@ def explore_template_start(payload: Dict[str, Any]):
         return JSONResponse(status_code=400, content={"status": "error", "error": "Dev-mode samples cannot be started in prod mode"})
 
     if runtime_mode == "development":
-        try:
-            template_files = _prepare_showcase_template_files(sample, dev_runtime_target_root)
-        except ValueError as exc:
-            return JSONResponse(status_code=400, content={"status": "error", "error": str(exc)})
-        except Exception as exc:
-            return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
         if dev_runtime_target_root != current_runtime_root:
             try:
                 _spawn_skillpilot_dev_start(dev_runtime_target_root)
@@ -1950,65 +1563,28 @@ def explore_template_start(payload: Dict[str, Any]):
                 return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
             return {
                 "status": "relaunching_current_dev",
-                "target_url": _build_prompt_target_url(
-                    "",
-                    prompt,
-                    showcase_directory=_showcase_session_directory(sample, dev_runtime_target_root),
-                    system_skills=system_skills,
-                    showcase_id=sample_id,
-                ),
+                "target_url": _build_prompt_target_url("", prompt),
                 "sample_id": sample_id,
                 "use_worktree": False,
-                "template_files": template_files,
             }
         return {
             "status": "launched",
-            "target_url": _build_prompt_target_url(
-                "",
-                prompt,
-                showcase_directory=_showcase_session_directory(sample, dev_runtime_target_root),
-                system_skills=system_skills,
-                showcase_id=sample_id,
-            ),
+            "target_url": _build_prompt_target_url("", prompt),
             "sample_id": sample_id,
             "use_worktree": False,
-            "template_files": template_files,
         }
 
     if not use_worktree and sample_in_mode != "dev":
-        try:
-            template_files = _prepare_showcase_template_files(sample, _REPO_ROOT)
-        except ValueError as exc:
-            return JSONResponse(status_code=400, content={"status": "error", "error": str(exc)})
-        except Exception as exc:
-            return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
         return {
             "status": "launched",
-            "target_url": _build_prompt_target_url(
-                "",
-                prompt,
-                showcase_directory=_showcase_session_directory(sample, _REPO_ROOT),
-                system_skills=system_skills,
-                showcase_id=sample_id,
-            ),
+            "target_url": _build_prompt_target_url("", prompt),
             "sample_id": sample_id,
             "use_worktree": False,
-            "template_files": template_files,
         }
 
     git_tag = sample.get("git_tag")
     worktree_path = _explore_worktree_path(sample_id) if use_worktree else _REPO_ROOT
-    def build_current_instance_target_url() -> str:
-        return _build_prompt_target_url(
-            "",
-            prompt,
-            str(worktree_path) if use_worktree else None,
-            showcase_directory=_showcase_session_directory(sample, worktree_path),
-            system_skills=system_skills,
-            showcase_id=sample_id,
-        )
-
-    current_instance_target_url = build_current_instance_target_url()
+    current_instance_target_url = _build_prompt_target_url("", prompt, str(worktree_path) if use_worktree else None)
     base_ref = str(git_tag) if (checkout_tag and git_tag) else None
     snapshot = _managed_explore_dev_snapshot()
     same_managed_worktree = str(snapshot.get("worktree_path") or "") == str(worktree_path)
@@ -2025,12 +1601,6 @@ def explore_template_start(payload: Dict[str, Any]):
         _stop_managed_explore_dev_if_running()
 
     if same_managed_worktree and _explore_tmux_session_exists():
-        try:
-            template_files = _prepare_showcase_template_files(sample, worktree_path)
-        except ValueError as exc:
-            return JSONResponse(status_code=400, content={"status": "error", "error": str(exc)})
-        except Exception as exc:
-            return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
         if _probe_explore_dev_ready():
             return {
                 "status": "monitor_dev_and_continue" if needs_prod_dev_monitor_step else "launched",
@@ -2040,7 +1610,6 @@ def explore_template_start(payload: Dict[str, Any]):
                 "use_worktree": use_worktree,
                 "worktree_path": str(worktree_path),
                 "reused_running_dev": True,
-                "template_files": template_files,
             }
         if needs_prod_dev_monitor_step:
             existing_launch_id = str(snapshot.get("launch_id") or "").strip()
@@ -2063,7 +1632,6 @@ def explore_template_start(payload: Dict[str, Any]):
                 "use_worktree": use_worktree,
                 "worktree_path": str(worktree_path),
                 "reused_running_dev": False,
-                "template_files": template_files,
             }
             if existing_launch_id:
                 response["launch_id"] = existing_launch_id
@@ -2083,17 +1651,12 @@ def explore_template_start(payload: Dict[str, Any]):
                 result.update({"sample_id": sample_id})
                 return result
 
-        template_files = _prepare_showcase_template_files(sample, worktree_path)
-        current_instance_target_url = build_current_instance_target_url()
-
         try:
             _run_skillpilot_command(["stop", "--dev"], cwd=worktree_path, timeout=90.0)
         except Exception:
             pass
 
         _start_explore_dev_session(worktree_path)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"status": "error", "error": str(exc)})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
 
@@ -2118,7 +1681,6 @@ def explore_template_start(payload: Dict[str, Any]):
             "sample_id": sample_id,
             "use_worktree": use_worktree,
             "worktree_path": str(worktree_path),
-            "template_files": template_files,
         }
 
     target_url = current_instance_target_url
@@ -2133,7 +1695,6 @@ def explore_template_start(payload: Dict[str, Any]):
         ),
     )
     _set_managed_explore_dev(worktree_path=str(worktree_path), launch_id=launch_id, started_at=time.time())
-    launch["template_files"] = template_files
     return launch
 
 
@@ -2324,19 +1885,6 @@ def task_file(path: str):
 
     media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
     return FileResponse(file_path, media_type=media_type, filename=file_path.name)
-
-
-@router.get("/api/tasks/raw/{path:path}")
-def task_raw_file(path: str):
-    try:
-        file_path = _safe_tasks_path(path)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc)})
-    except FileNotFoundError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-
-    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    return FileResponse(file_path, media_type=media_type)
 
 
 @router.get("/api/media/tree")
@@ -2549,7 +2097,10 @@ def vibe_coding_create_project(payload: Dict[str, Any]):
     normalized_project = _normalize_vibe_project_name(project_name)
     project_dir = _unique_vibe_project_dir_path(normalized_project)
     project_dir.mkdir(parents=False, exist_ok=False)
-    file_path = project_dir / "requirements.md"
+    design_docs_dir = project_dir / VIBE_CODING_DESIGN_DOCS_DIR
+    design_docs_dir.mkdir(parents=True, exist_ok=True)
+    (design_docs_dir / VIBE_CODING_ARCHIVE_DIR).mkdir(parents=True, exist_ok=True)
+    file_path = design_docs_dir / "requirements.md"
     file_path.write_text(requirements, encoding="utf-8")
     return {
         "status": "ok",
@@ -2623,8 +2174,9 @@ def vibe_coding_delete(payload: Dict[str, Any]):
     file_path.unlink()
     removed_folder = None
     parent_dir = file_path.parent
+    design_docs_dir = project_dir / VIBE_CODING_DESIGN_DOCS_DIR
     cleanup_dir = project_dir if parent_dir == project_dir else parent_dir
-    if cleanup_dir != project_dir:
+    if cleanup_dir != design_docs_dir:
         try:
             cleanup_dir.rmdir()
             removed_folder = str(cleanup_dir.relative_to(VIBE_CODING_DIR))
@@ -2772,28 +2324,6 @@ def research_file(path: str):
     return FileResponse(file_path, media_type=media_type, filename=file_path.name)
 
 
-@router.get("/api/research/static/{project}")
-def research_static_root(project: str):
-    return research_static_file(project, "index.html")
-
-
-@router.get("/api/research/static/{project}/{file_path:path}")
-def research_static_file(project: str, file_path: str):
-    try:
-        resolved = _safe_research_static_path(project, file_path)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc)})
-    except FileNotFoundError as exc:
-        return JSONResponse(status_code=404, content={"error": str(exc)})
-
-    media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
-    return FileResponse(
-        resolved,
-        media_type=media_type,
-        headers={"Cache-Control": "private, no-store, max-age=0"},
-    )
-
-
 # ---------------------------------------------------------------------------
 # Social Media routes
 # ---------------------------------------------------------------------------
@@ -2816,7 +2346,8 @@ def _social_history() -> dict:
     if not _SOCIAL_HISTORY_PATH.exists():
         return {"posts": [], "next_scheduled": {}}
     try:
-        return json.loads(_SOCIAL_HISTORY_PATH.read_text(encoding="utf-8"))
+        import json as _json
+        return _json.loads(_SOCIAL_HISTORY_PATH.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return {"posts": [], "next_scheduled": {}}
 
@@ -2926,152 +2457,6 @@ def social_delete(payload: Dict[str, Any]):
 @router.get("/api/social/history")
 def social_history():
     return _social_history()
-
-
-@router.post("/api/social/publish")
-def social_publish(payload: Dict[str, Any]):
-    """Publish a draft to a social platform via the automation script (no AI)."""
-    raw_path = str(payload.get("path") or "").strip()
-    raw_platform = str(payload.get("platform") or "").strip().lower()
-
-    if not raw_path:
-        return JSONResponse(status_code=400, content={"error": "Missing path"})
-    if not raw_platform:
-        return JSONResponse(status_code=400, content={"error": "Missing platform"})
-    if raw_platform not in ("linkedin", "x", "xiaohongshu"):
-        return JSONResponse(status_code=400, content={"error": f"Unsupported platform: {raw_platform}"})
-
-    try:
-        _safe_social_path(raw_path)
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc)})
-
-    script = _REPO_ROOT / "core" / "bin" / "social-publish"
-    if not script.is_file():
-        return JSONResponse(status_code=500, content={"error": "Publish script not found"})
-
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(script), raw_path, raw_platform],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(_REPO_ROOT),
-            env={**os.environ, "AGENT_BROWSER_DEFAULT_TIMEOUT": "30"},
-        )
-        return {
-            "status": "ok" if proc.returncode == 0 else "failed",
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "returncode": proc.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return JSONResponse(status_code=504, content={"error": "Publish timed out after 120s"})
-    except Exception as exc:
-        return JSONResponse(status_code=500, content={"error": str(exc)})
-
-
-# --- Calendar ---
-
-_CALENDAR_PATH = _REPO_ROOT / ".skillpilot" / "content-calendar.json"
-_CALENDAR_PLATFORMS = {"linkedin", "x", "xiaohongshu"}
-_CALENDAR_STATUSES = {"idea", "scheduled", "drafted", "published"}
-
-
-def _read_calendar() -> list[dict]:
-    if not _CALENDAR_PATH.exists():
-        return []
-    try:
-        data = json.loads(_CALENDAR_PATH.read_text(encoding="utf-8"))
-        return data.get("items", []) if isinstance(data, dict) else []
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-def _write_calendar(items: list[dict]) -> None:
-    _CALENDAR_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _CALENDAR_PATH.write_text(json.dumps({"items": items}, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _find_calendar_item(items: list[dict], item_id: str) -> tuple[int, dict] | None:
-    for i, item in enumerate(items):
-        if item.get("id") == item_id:
-            return i, item
-    return None
-
-
-@router.get("/api/social/calendar")
-def social_calendar(platform: str | None = Query(None), status: str | None = Query(None)):
-    items = _read_calendar()
-    if platform and platform in _CALENDAR_PLATFORMS:
-        items = [i for i in items if i.get("platform") == platform]
-    if status and status in _CALENDAR_STATUSES:
-        items = [i for i in items if i.get("status") == status]
-    items.sort(key=lambda i: i.get("scheduledDate", ""), reverse=True)
-    return {"items": items}
-
-
-@router.post("/api/social/calendar")
-def social_calendar_create(payload: Dict[str, Any]):
-    topic = (payload.get("topic") or "").strip()
-    platform = (payload.get("platform") or "").strip()
-    if not topic:
-        return JSONResponse(status_code=400, content={"error": "Topic is required"})
-    if platform not in _CALENDAR_PLATFORMS:
-        return JSONResponse(status_code=400, content={"error": f"Invalid platform: {platform}"})
-
-    items = _read_calendar()
-    new_item = {
-        "id": uuid4().hex[:12],
-        "topic": topic,
-        "platform": platform,
-        "status": payload.get("status", "idea"),
-        "scheduledDate": (payload.get("scheduledDate") or "").strip(),
-        "draftPath": (payload.get("draftPath") or "").strip(),
-        "notes": (payload.get("notes") or "").strip(),
-        "createdAt": payload.get("createdAt") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "publishedAt": None,
-    }
-    if new_item["status"] not in _CALENDAR_STATUSES:
-        new_item["status"] = "idea"
-    items.append(new_item)
-    _write_calendar(items)
-    return {"status": "ok", "item": new_item}
-
-
-@router.patch("/api/social/calendar/{item_id}")
-def social_calendar_update(item_id: str, payload: Dict[str, Any]):
-    items = _read_calendar()
-    result = _find_calendar_item(items, item_id)
-    if result is None:
-        return JSONResponse(status_code=404, content={"error": "Calendar item not found"})
-    i, item = result
-    for key in ("topic", "platform", "status", "scheduledDate", "draftPath", "notes"):
-        if key in payload:
-            val = payload[key]
-            if isinstance(val, str):
-                val = val.strip()
-            if key == "platform" and val not in _CALENDAR_PLATFORMS:
-                return JSONResponse(status_code=400, content={"error": f"Invalid platform: {val}"})
-            if key == "status" and val not in _CALENDAR_STATUSES:
-                return JSONResponse(status_code=400, content={"error": f"Invalid status: {val}"})
-            item[key] = val
-    if payload.get("publishedAt"):
-        item["publishedAt"] = payload["publishedAt"]
-    items[i] = item
-    _write_calendar(items)
-    return {"status": "ok", "item": item}
-
-
-@router.delete("/api/social/calendar/{item_id}")
-def social_calendar_delete(item_id: str):
-    items = _read_calendar()
-    result = _find_calendar_item(items, item_id)
-    if result is None:
-        return JSONResponse(status_code=404, content={"error": "Calendar item not found"})
-    items.pop(result[0])
-    _write_calendar(items)
-    return {"status": "ok", "deleted": item_id}
 
 
 @router.get("/api/skill-pilot-development/features")
@@ -3272,64 +2657,8 @@ def courses_latest():
     return {"path": latest[0]}
 
 
-def _is_remote_course(course: str) -> bool:
-    return isinstance(course, str) and course.lower().startswith(("http://", "https://"))
-
-
-def _validate_remote_course_url(course: str) -> str:
-    parsed = urllib.parse.urlparse(course)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise HTTPException(status_code=400, detail="Remote courses must use an http:// or https:// URL")
-    if not parsed.path.lower().endswith(".md"):
-        raise HTTPException(status_code=400, detail="Remote courses must point to a .md file")
-
-    try:
-        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise HTTPException(status_code=400, detail=f"Unable to resolve remote course host: {exc}") from exc
-
-    for address in addresses:
-        ip = ipaddress.ip_address(address[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            raise HTTPException(status_code=400, detail="Remote course host is not allowed")
-
-    return course
-
-
-def _fetch_remote_course_content(course: str) -> str:
-    url = _validate_remote_course_url(course)
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "text/markdown,text/plain,text/*,*/*;q=0.5",
-            "User-Agent": "SkillPilotCourseLoader/1.0",
-        },
-    )
-    max_bytes = 2 * 1024 * 1024
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            final_url = response.geturl()
-            if not final_url.lower().startswith(("http://", "https://")):
-                raise HTTPException(status_code=400, detail="Remote course redirects must stay on http:// or https:// URLs")
-            _validate_remote_course_url(final_url)
-            data = response.read(max_bytes + 1)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch remote course: {exc}") from exc
-
-    if len(data) > max_bytes:
-        raise HTTPException(status_code=413, detail="Remote course is too large")
-    return data.decode("utf-8", errors="replace")
-
-
 @router.get("/api/courses/content")
 def course_content(course: str):
-    if _is_remote_course(course):
-        content = _fetch_remote_course_content(course)
-        meta = read_course_meta(content)
-        return {"path": course, "content": content, "meta": meta, "remote": True}
-
     file_path = safe_course_path(course)
     content = file_path.read_text(encoding="utf-8", errors="replace")
     meta = read_course_meta(content)

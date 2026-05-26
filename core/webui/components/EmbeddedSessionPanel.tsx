@@ -1,6 +1,7 @@
 import React from 'react';
-import { ActionIcon, Button, Text, Textarea } from '@mantine/core';
+import { ActionIcon, Button, Group, Select, Text, Textarea } from '@mantine/core';
 import { IconX } from '@tabler/icons-react';
+import { useSessionRoots } from '../libs/session-roots';
 
 type NextNodeTrigger = 'auto_continue' | 'start_by_prompt';
 
@@ -23,8 +24,8 @@ interface EmbeddedSessionPanelProps {
   setNewSessionAuto: (value: boolean) => void;
   newSessionNetwork: boolean;
   setNewSessionNetwork: (value: boolean) => void;
-  newSessionNextNodeTrigger?: NextNodeTrigger;
-  setNewSessionNextNodeTrigger?: (value: NextNodeTrigger) => void;
+  newSessionNextNodeTrigger: NextNodeTrigger;
+  setNewSessionNextNodeTrigger: (value: NextNodeTrigger) => void;
   newSessionWorkflowResumeAvailable: boolean;
   newSessionWorkflowResume: boolean;
   setNewSessionWorkflowResume: (value: boolean) => void;
@@ -36,6 +37,12 @@ interface EmbeddedSessionPanelProps {
   continuingWorkflow: boolean;
   onContinueWorkflow: () => void;
   hideSessionRootSelect?: boolean;
+  availableModels?: string[];
+  selectedModel?: string | null;
+  onModelChange?: (value: string | null) => void;
+  availableEffortLevels?: string[];
+  selectedEffort?: string | null;
+  onEffortChange?: (value: string | null) => void;
 }
 
 export default function EmbeddedSessionPanel({
@@ -50,6 +57,8 @@ export default function EmbeddedSessionPanel({
   setNewSessionAuto,
   newSessionNetwork,
   setNewSessionNetwork,
+  newSessionNextNodeTrigger,
+  setNewSessionNextNodeTrigger,
   newSessionWorkflowResumeAvailable,
   newSessionWorkflowResume,
   setNewSessionWorkflowResume,
@@ -60,7 +69,21 @@ export default function EmbeddedSessionPanel({
   workflowSessionActive,
   continuingWorkflow,
   onContinueWorkflow,
+  hideSessionRootSelect = false,
+  availableModels,
+  selectedModel,
+  onModelChange,
+  availableEffortLevels,
+  selectedEffort,
+  onEffortChange,
 }: EmbeddedSessionPanelProps) {
+  const {
+    sessionRootOptions,
+    hasSessionWorktrees,
+    selectedSessionPath,
+    setSelectedSessionPath,
+  } = useSessionRoots();
+
   return (
     <div
       style={{
@@ -137,6 +160,41 @@ export default function EmbeddedSessionPanel({
                 Workflow mode: {`core/workflows/${newSessionWorkflow}`}
               </Text>
             )}
+            {!hideSessionRootSelect && hasSessionWorktrees && (
+              <Select
+                label="Worktree"
+                placeholder="Choose where to start"
+                value={selectedSessionPath || null}
+                onChange={(value) => setSelectedSessionPath(value || '')}
+                data={sessionRootOptions.map((root) => ({ value: root.value, label: root.label }))}
+                size="xs"
+                mb={8}
+              />
+            )}
+            {availableModels && availableModels.length > 0 && onModelChange && (
+              <Group spacing="xs" mb={8} grow>
+                <Select
+                  label="Model"
+                  placeholder="Default model"
+                  value={selectedModel || null}
+                  onChange={(value) => onModelChange(value || null)}
+                  data={availableModels.map((m) => ({ value: m, label: m }))}
+                  size="xs"
+                  clearable
+                />
+                {availableEffortLevels && availableEffortLevels.length > 0 && onEffortChange && (
+                  <Select
+                    label="Effort"
+                    placeholder="Default effort"
+                    value={selectedEffort || null}
+                    onChange={(value) => onEffortChange(value || null)}
+                    data={availableEffortLevels.map((e) => ({ value: e, label: e }))}
+                    size="xs"
+                    clearable
+                  />
+                )}
+              </Group>
+            )}
           </div>
           <div style={{ flex: 1, minHeight: 0, padding: '0 14px 14px 14px' }}>
             <Textarea
@@ -145,7 +203,7 @@ export default function EmbeddedSessionPanel({
               onChange={(event) => setSessionPromptText(event.currentTarget.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-                  onStart(undefined);
+                  onStart(hideSessionRootSelect ? undefined : (selectedSessionPath || undefined));
                 }
               }}
               autosize={false}
@@ -192,6 +250,16 @@ export default function EmbeddedSessionPanel({
               </label>
               {newSessionWorkflow && (
                 <>
+                  <Select
+                    value={newSessionNextNodeTrigger}
+                    onChange={(value) => setNewSessionNextNodeTrigger((value as NextNodeTrigger) || 'auto_continue')}
+                    data={[
+                      { value: 'auto_continue', label: 'Auto continue' },
+                      { value: 'start_by_prompt', label: 'Start by prompt' },
+                    ]}
+                    size="xs"
+                    style={{ width: 160 }}
+                  />
                   {newSessionWorkflowResumeAvailable && (
                     <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer' }}>
                       <input type="checkbox" checked={newSessionWorkflowResume} onChange={(event) => setNewSessionWorkflowResume(event.currentTarget.checked)} />
@@ -202,7 +270,7 @@ export default function EmbeddedSessionPanel({
               )}
             </div>
             <Button
-              onClick={() => onStart(undefined)}
+              onClick={() => onStart(hideSessionRootSelect ? undefined : (selectedSessionPath || undefined))}
               disabled={!sessionPromptText.trim() || startingSession}
               loading={startingSession}
             >

@@ -11,7 +11,15 @@ def _parse_bool_value(value: Any) -> bool:
 def llm_providers():
     providers = load_llm_providers()
     return {
-        "providers": [{"id": p.get("id"), "name": p.get("name")} for p in providers],
+        "providers": [
+            {
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "models": p.get("models", []),
+                "effort_levels": p.get("effort_levels", []),
+            }
+            for p in providers
+        ],
         "default": get_default_llm_provider_id(),
         "doctor_default": get_default_doctor_provider_id(),
     }
