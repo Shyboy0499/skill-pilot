@@ -18,6 +18,7 @@ Output:
 import argparse
 import json
 import logging
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -134,21 +135,44 @@ def verify_post_published(page, short_text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def publish_post(content: str, headless: bool = False) -> dict:
+def publish_post(content: str, headless: bool = False, cdp_port: str = "") -> dict:
     short_text = content[:60].replace("\n", " ")
+    cdp_connected = False
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
-        context_kwargs: dict = {}
-        if AUTH_FILE.exists():
+        if cdp_port:
+            # Ensure Chrome has at least one tab open (browser-level CDP
+            # connection fails if Chrome has zero open tabs).
             try:
-                context_kwargs["storage_state"] = str(AUTH_FILE)
-                log.info("Loaded auth state from disk.")
+                subprocess.run(
+                    ["open", "-a", "Google Chrome", FEED_URL],
+                    capture_output=True, timeout=5,
+                )
+                time.sleep(2)
             except Exception:
-                log.warning("Could not load auth state, starting fresh.")
+                pass
 
-        context = browser.new_context(**context_kwargs)
-        page = context.new_page()
+            try:
+                log.info(f"Connecting to Chrome via CDP port {cdp_port}...")
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+                context = browser.contexts[0]
+                page = context.new_page()
+                cdp_connected = True
+            except Exception as e:
+                log.warning(f"CDP connection failed: {e}")
+                log.warning("Falling back to own browser.")
+
+        if not cdp_connected:
+            browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
+            context_kwargs: dict = {}
+            if AUTH_FILE.exists():
+                try:
+                    context_kwargs["storage_state"] = str(AUTH_FILE)
+                    log.info("Loaded auth state from disk.")
+                except Exception:
+                    log.warning("Could not load auth state, starting fresh.")
+            context = browser.new_context(**context_kwargs)
+            page = context.new_page()
 
         try:
             # --- Navigate ---
@@ -156,27 +180,31 @@ def publish_post(content: str, headless: bool = False) -> dict:
             page.goto(FEED_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
 
-            # --- Auth check (URL redirect OR login form on page) ---
-            needs_login = (
-                "login" in page.url
-                or "checkpoint" in page.url
-                or page.get_by_text("Sign in").first.is_visible()
-            )
-            if needs_login:
-                if headless:
-                    raise RuntimeError("LinkedIn login required. Run without --headless first.")
-                log.info("Login required. Please log in manually in the browser window.")
-                log.info("Waiting up to 120 seconds...")
-                page.wait_for_url(f"{FEED_URL}*", timeout=120_000)
-                page.wait_for_timeout(2000)
-                context.storage_state(path=str(AUTH_FILE))
-                log.info("Auth state saved.")
+            # --- Auth check (skip in CDP mode — already authenticated) ---
+            if not cdp_port:
+                needs_login = (
+                    "login" in page.url
+                    or "checkpoint" in page.url
+                    or page.get_by_text("Sign in").first.is_visible()
+                )
+                if needs_login:
+                    if headless:
+                        raise RuntimeError("LinkedIn login required. Run without --headless first.")
+                    log.info("Login required. Please log in manually in the browser window.")
+                    log.info("Waiting up to 120 seconds...")
+                    page.wait_for_url(f"{FEED_URL}*", timeout=120_000)
+                    page.wait_for_timeout(2000)
+                    context.storage_state(path=str(AUTH_FILE))
+                    log.info("Auth state saved.")
 
             # --- Step 1: Click "Start a post" ---
             log.info('Looking for "Start a post" button...')
             start_btn = page.get_by_text(POST_TRIGGER_TEXT, exact=True).first
             start_btn.wait_for(state="visible", timeout=15_000)
-            start_btn.click()
+            try:
+                start_btn.click(timeout=5000)
+            except Exception:
+                start_btn.dispatch_event("click")
             page.wait_for_timeout(2000)
             log.info("Clicked post trigger. Composer should be open.")
 
@@ -190,10 +218,23 @@ def publish_post(content: str, headless: bool = False) -> dict:
 
             # --- Step 3: Click Post ---
             log.info('Looking for "Post" button...')
-            # Use exact match to avoid matching "Start a post"
-            post_btn = page.locator('button:has-text("Post"):not(:has-text("Start"))').first
-            post_btn.wait_for(state="visible", timeout=10_000)
-            post_btn.click()
+            # Find the real Post button: exact text match, visible, enabled.
+            # Avoid substring matches: "New posts", "Start a post", "Post to Anyone"
+            post_btn = None
+            for btn in page.locator("button").all():
+                try:
+                    if btn.inner_text().strip() == POST_BUTTON_TEXT and btn.is_visible() and btn.is_enabled():
+                        post_btn = btn
+                        break
+                except Exception:
+                    continue
+            if post_btn is None:
+                raise RuntimeError("Could not find an enabled Post button on LinkedIn")
+            log.info("Found Post button.")
+            try:
+                post_btn.click(timeout=5000)
+            except Exception:
+                post_btn.dispatch_event("click")
             log.info("Clicked Post.")
             page.wait_for_timeout(4000)
 
@@ -206,11 +247,11 @@ def publish_post(content: str, headless: bool = False) -> dict:
             ok = verify_post_published(page, content)
             if ok:
                 context.storage_state(path=str(AUTH_FILE))
-                browser.close()
+                if not cdp_connected: browser.close()
                 log.info("Publish verified — success.")
                 return save_result("success", screenshot=screenshot_path)
 
-            browser.close()
+            if not cdp_connected: browser.close()
             log.error("Verification failed after publish.")
             return save_result("failed", screenshot=screenshot_path, error="Verification failed")
 
@@ -221,7 +262,7 @@ def publish_post(content: str, headless: bool = False) -> dict:
                 page.screenshot(path=screenshot_path, full_page=True)
             except Exception:
                 screenshot_path = ""
-            browser.close()
+            if not cdp_connected: browser.close()
             log.error(f"Timeout: {e}")
             return save_result("failed", screenshot=screenshot_path, error=str(e))
 
@@ -232,7 +273,7 @@ def publish_post(content: str, headless: bool = False) -> dict:
                 page.screenshot(path=screenshot_path, full_page=True)
             except Exception:
                 screenshot_path = ""
-            browser.close()
+            if not cdp_connected: browser.close()
             log.error(f"Error: {e}")
             return save_result("failed", screenshot=screenshot_path, error=str(e))
 
@@ -247,6 +288,7 @@ def main() -> None:
     parser.add_argument("--content-file", required=True, help="Path to markdown content file")
     parser.add_argument("--mode", choices=["draft", "publish", "verify-only"], default="publish")
     parser.add_argument("--headless", action="store_true", help="Run browser headless")
+    parser.add_argument("--cdp-port", default="", help="Connect to existing Chrome via CDP port (e.g. 9222)")
     parser.add_argument("--verify", dest="verify_flag", default="true")
     args = parser.parse_args()
 
@@ -260,7 +302,7 @@ def main() -> None:
     log.info(f"Content loaded: {len(content)} chars from {args.content_file}")
 
     if args.mode == "publish":
-        result = publish_post(content, headless=args.headless)
+        result = publish_post(content, headless=args.headless, cdp_port=args.cdp_port)
     elif args.mode == "verify-only":
         print(json.dumps({"status": "skipped", "action": "verify-only", "platform": "linkedin"}))
         sys.exit(0)
