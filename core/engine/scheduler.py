@@ -3,6 +3,8 @@ import json5_io as json5
 import os
 import secrets
 import shlex
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -180,6 +182,35 @@ def start_scheduler(schedules: List[Dict[str, Any]]) -> None:
         except (ValueError, KeyError) as exc:
             logger.warning("[scheduler] invalid social scheduler cron %r: %s", social_cron, exc)
 
+    # Register health check job
+    health_config = social_config.get("health_check", {})
+    if health_config.get("enabled", True):
+        interval = health_config.get("interval_minutes", 360)
+        _scheduler.add_job(
+            _run_health_check,
+            trigger="interval",
+            minutes=interval,
+            id="social-health-check",
+            name="Social Media Health Check",
+            replace_existing=True,
+        )
+        logger.info(f"Social health check scheduled every {interval} min.")
+        added += 1
+
+    # Register content evaluation job
+    eval_config = social_config.get("content_improvement", {})
+    if eval_config.get("enabled", True):
+        _scheduler.add_job(
+            _run_content_evaluation,
+            trigger="interval",
+            hours=12,
+            id="social-content-eval",
+            name="Social Media Content Evaluation",
+            replace_existing=True,
+        )
+        logger.info("Social content evaluation scheduled every 12h.")
+        added += 1
+
     _scheduler.start()
     logger.info("[scheduler] started with %d jobs", added)
 
@@ -316,3 +347,61 @@ def _run_social_publish() -> None:
             logger.info("[social-scheduler] Updated calendar with %d published items", published_count)
         except Exception as exc:
             logger.error("[social-scheduler] Failed to save calendar: %s", exc)
+
+
+def _run_health_check() -> None:
+    """Run verify-only for each platform. On failure, trigger auto-repair."""
+    logger.info("[health-check] Starting health check...")
+    platforms = _load_social_schedule_config().get("platforms", ["linkedin", "x"])
+
+    for platform in platforms:
+        script = str(_REPO_ROOT / "social-media" / "scripts" / f"{platform}.py")
+        if not Path(script).exists():
+            logger.warning(f"[health-check] Script not found: {script}")
+            continue
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, "--mode", "verify-only"],
+                capture_output=True, text=True, timeout=60,
+                cwd=str(_REPO_ROOT),
+            )
+            if proc.returncode != 0:
+                logger.warning(f"[health-check] {platform}: FAILED — {proc.stderr[:200]}")
+                repair_config = _load_social_schedule_config().get("health_check", {})
+                if repair_config.get("auto_repair", True):
+                    repair_script = str(_REPO_ROOT / "social-media" / "scripts" / "repair.py")
+                    logger.info(f"[health-check] Triggering auto-repair for {platform}...")
+                    subprocess.run(
+                        [sys.executable, repair_script, "--auto", platform],
+                        capture_output=True, text=True, timeout=120,
+                        cwd=str(_REPO_ROOT),
+                    )
+            else:
+                logger.info(f"[health-check] {platform}: OK")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[health-check] {platform}: timeout")
+        except Exception as exc:
+            logger.error(f"[health-check] {platform}: error — {exc}")
+
+
+def _run_content_evaluation() -> None:
+    """Check for posts published 48h+ ago that need AI evaluation."""
+    logger.info("[content-eval] Starting content evaluation scan...")
+    eval_script = str(_REPO_ROOT / "social-media" / "scripts" / "evaluate.py")
+    if not Path(eval_script).exists():
+        logger.warning(f"[content-eval] Script not found: {eval_script}")
+        return
+    try:
+        proc = subprocess.run(
+            [sys.executable, eval_script, "--auto"],
+            capture_output=True, text=True, timeout=300,
+            cwd=str(_REPO_ROOT),
+        )
+        if proc.returncode == 0:
+            logger.info(f"[content-eval] Done. {proc.stdout[:200]}")
+        else:
+            logger.warning(f"[content-eval] Failed: {proc.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        logger.warning("[content-eval] evaluation timed out")
+    except Exception as exc:
+        logger.error(f"[content-eval] error: {exc}")
