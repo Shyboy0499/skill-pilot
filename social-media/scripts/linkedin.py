@@ -137,6 +137,90 @@ def verify_post_published(page, short_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Verify-only (health check)
+# ---------------------------------------------------------------------------
+
+
+def verify_only_linkedin(headless: bool = False, cdp_port: str = "") -> dict:
+    """Health-check: verify browser auth and 'Start a post' button visibility without posting."""
+    cdp_connected = False
+
+    with sync_playwright() as p:
+        if cdp_port:
+            try:
+                subprocess.run(
+                    ["open", "-a", "Google Chrome", FEED_URL],
+                    capture_output=True, timeout=5,
+                )
+                time.sleep(2)
+            except Exception:
+                pass
+
+            try:
+                log.info(f"Connecting to Chrome via CDP port {cdp_port}...")
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
+                context = browser.contexts[0]
+                page = context.new_page()
+                cdp_connected = True
+            except Exception as e:
+                log.warning(f"CDP connection failed: {e}")
+                log.warning("Falling back to own browser.")
+
+        if not cdp_connected:
+            browser = p.chromium.launch(headless=headless, args=["--no-sandbox"])
+            context_kwargs: dict = {}
+            if AUTH_FILE.exists():
+                try:
+                    context_kwargs["storage_state"] = str(AUTH_FILE)
+                    log.info("Loaded auth state from disk.")
+                except Exception:
+                    log.warning("Could not load auth state, starting fresh.")
+            context = browser.new_context(**context_kwargs)
+            page = context.new_page()
+
+        try:
+            log.info(f"[verify-only] Navigating to {FEED_URL}...")
+            page.goto(FEED_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            # Auth check
+            if "login" in page.url or "checkpoint" in page.url:
+                log.error("[verify-only] Auth expired — URL contains login/checkpoint redirect.")
+                if not cdp_connected:
+                    browser.close()
+                return save_result("failed", error="auth-expired", action="verify-only")
+
+            # "Start a post" button check
+            start_btn = page.get_by_text(POST_TRIGGER_TEXT, exact=True).first
+            try:
+                start_btn.wait_for(state="visible", timeout=10_000)
+            except PlaywrightTimeoutError:
+                log.error('[verify-only] "Start a post" button not visible.')
+                if not cdp_connected:
+                    browser.close()
+                return save_result("failed", error="selector-not-found: Start a post button", action="verify-only")
+
+            log.info('[verify-only] "Start a post" button visible — health check passed.')
+            update_platform_state("linkedin", {
+                "last_health_check": now_iso(),
+                "failure_count": 0,
+            })
+
+            if not cdp_connected:
+                browser.close()
+            return save_result("success", action="verify-only")
+
+        except Exception as e:
+            log.error(f"[verify-only] Error: {e}")
+            if not cdp_connected:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            return save_result("failed", error=str(e), action="verify-only")
+
+
+# ---------------------------------------------------------------------------
 # Publish
 # ---------------------------------------------------------------------------
 
@@ -345,12 +429,21 @@ def publish_post(content: str, headless: bool = False, cdp_port: str = "") -> di
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LinkedIn publishing via Playwright")
-    parser.add_argument("--content-file", required=True, help="Path to markdown content file")
+    parser.add_argument("--content-file", default="", help="Path to markdown content file")
     parser.add_argument("--mode", choices=["draft", "publish", "verify-only"], default="publish")
     parser.add_argument("--headless", action="store_true", help="Run browser headless")
     parser.add_argument("--cdp-port", default="", help="Connect to existing Chrome via CDP port (e.g. 9222)")
     parser.add_argument("--verify", dest="verify_flag", default="true")
     args = parser.parse_args()
+
+    if args.mode == "verify-only":
+        result = verify_only_linkedin(args.headless, args.cdp_port)
+        sys.exit(0 if result["status"] == "success" else 1)
+
+    if not args.content_file:
+        log.error("--content-file is required for mode '%s'", args.mode)
+        print(json.dumps({"status": "failed", "error": "--content-file is required"}))
+        sys.exit(1)
 
     try:
         content = read_content(args.content_file)
@@ -363,9 +456,6 @@ def main() -> None:
 
     if args.mode == "publish":
         result = publish_post(content, headless=args.headless, cdp_port=args.cdp_port)
-    elif args.mode == "verify-only":
-        print(json.dumps({"status": "skipped", "action": "verify-only", "platform": "linkedin"}))
-        sys.exit(0)
     else:
         log.error(f"Mode '{args.mode}' not implemented yet.")
         sys.exit(1)
