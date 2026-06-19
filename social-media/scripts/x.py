@@ -18,6 +18,7 @@ Output:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import subprocess
@@ -27,6 +28,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+from common import (
+    ROOT, POSTS_PUBLISHED, STATE_FILE,
+    check_duplicate, classify_error, save_debug_bundle,
+    update_platform_state, append_version_log,
+    content_hash, now_iso, get_platform_state,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = ROOT / "social-media" / "scripts"
@@ -207,6 +215,23 @@ def publish_post(content: str, headless: bool = False, cdp_port: str = "") -> di
                     context.storage_state(path=str(AUTH_FILE))
                     log.info("Auth state saved.")
 
+            # --- Dedup gate ---
+            HISTORY_PATH = ROOT / ".skillpilot" / "social-marketing-history.json"
+            dup = check_duplicate(content, draft_path="", history_path=HISTORY_PATH)
+            if dup:
+                log.warning(f"Deduplication: {dup['reason']} — {dup.get('matched', '')}")
+                log.warning("Skipping publish — content already published.")
+                if not cdp_connected:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                return save_result(
+                    "skipped",
+                    error=f"Duplicate: {dup['reason']}",
+                    action="publish_post",
+                )
+
             # --- Anti-bot gate ---
             if "graduated-access" in page.url:
                 log.warning("X is showing graduated-access rate-limit page.")
@@ -273,6 +298,40 @@ def publish_post(content: str, headless: bool = False, cdp_port: str = "") -> di
                 context.storage_state(path=str(AUTH_FILE))
                 if not cdp_connected: browser.close()
                 log.info("Publish verified — success.")
+                # Save post record for dedup and content improvement
+                ts = int(time.time())
+                record = {
+                    "post_id": f"x-{ts}",
+                    "platform": "x",
+                    "published_at": now_iso(),
+                    "content_file": "",
+                    "content": content,
+                    "hook": content.split("\n")[0][:120] if content else "",
+                    "call_to_action": "",
+                    "url": "",
+                    "screenshot": screenshot_path,
+                    "content_hash": content_hash(content),
+                    "metrics": {
+                        "fetched_at": None,
+                        "likes": 0,
+                        "comments": 0,
+                        "reposts": 0,
+                        "impressions": 0,
+                    },
+                    "ai_evaluation": {
+                        "evaluated_at": None,
+                        "hook_effective": None,
+                        "too_broad": None,
+                        "too_salesy": None,
+                        "showed_insight": None,
+                        "clear_audience": None,
+                        "invited_reply": None,
+                        "what_to_test_next": None,
+                    },
+                }
+                record_path = POSTS_PUBLISHED / f"x-{ts}.json"
+                record_path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+                log.info(f"Post record saved: {record_path.name}")
                 return save_result("success", screenshot=screenshot_path)
 
             # Retry click once
@@ -292,6 +351,40 @@ def publish_post(content: str, headless: bool = False, cdp_port: str = "") -> di
                             context.storage_state(path=str(AUTH_FILE))
                             if not cdp_connected: browser.close()
                             log.info(f"Publish verified — success on retry {retry + 1}.")
+                            # Save post record for dedup and content improvement
+                            ts = int(time.time())
+                            record = {
+                                "post_id": f"x-{ts}",
+                                "platform": "x",
+                                "published_at": now_iso(),
+                                "content_file": "",
+                                "content": content,
+                                "hook": content.split("\n")[0][:120] if content else "",
+                                "call_to_action": "",
+                                "url": "",
+                                "screenshot": screenshot_path,
+                                "content_hash": content_hash(content),
+                                "metrics": {
+                                    "fetched_at": None,
+                                    "likes": 0,
+                                    "comments": 0,
+                                    "reposts": 0,
+                                    "impressions": 0,
+                                },
+                                "ai_evaluation": {
+                                    "evaluated_at": None,
+                                    "hook_effective": None,
+                                    "too_broad": None,
+                                    "too_salesy": None,
+                                    "showed_insight": None,
+                                    "clear_audience": None,
+                                    "invited_reply": None,
+                                    "what_to_test_next": None,
+                                },
+                            }
+                            record_path = POSTS_PUBLISHED / f"x-{ts}.json"
+                            record_path.write_text(json.dumps(record, indent=2, ensure_ascii=False))
+                            log.info(f"Post record saved: {record_path.name}")
                             return save_result("success", screenshot=screenshot_path)
                         break
 
@@ -306,9 +399,17 @@ def publish_post(content: str, headless: bool = False, cdp_port: str = "") -> di
                 page.screenshot(path=screenshot_path, full_page=True)
             except Exception:
                 screenshot_path = ""
+            error_category = classify_error(str(e), page.url if hasattr(page, 'url') else "")
+            bundle = save_debug_bundle("x", str(e), page.content() if hasattr(page, 'content') else "", screenshot_path)
+            update_platform_state("x", {
+                "last_failure": now_iso(),
+                "last_error": str(e),
+                "last_error_category": error_category,
+                "failure_count": get_platform_state("x").get("failure_count", 0) + 1,
+            })
             if not cdp_connected: browser.close()
-            log.error(f"Timeout: {e}")
-            return save_result("failed", screenshot=screenshot_path, error=str(e))
+            log.error(f"Error [{error_category}]: {e}")
+            return save_result("failed", screenshot=screenshot_path, error=f"[{error_category}] {e}")
 
         except Exception as e:
             ts = int(time.time())
@@ -317,9 +418,17 @@ def publish_post(content: str, headless: bool = False, cdp_port: str = "") -> di
                 page.screenshot(path=screenshot_path, full_page=True)
             except Exception:
                 screenshot_path = ""
+            error_category = classify_error(str(e), page.url if hasattr(page, 'url') else "")
+            bundle = save_debug_bundle("x", str(e), page.content() if hasattr(page, 'content') else "", screenshot_path)
+            update_platform_state("x", {
+                "last_failure": now_iso(),
+                "last_error": str(e),
+                "last_error_category": error_category,
+                "failure_count": get_platform_state("x").get("failure_count", 0) + 1,
+            })
             if not cdp_connected: browser.close()
-            log.error(f"Error: {e}")
-            return save_result("failed", screenshot=screenshot_path, error=str(e))
+            log.error(f"Error [{error_category}]: {e}")
+            return save_result("failed", screenshot=screenshot_path, error=f"[{error_category}] {e}")
 
 
 # ---------------------------------------------------------------------------
