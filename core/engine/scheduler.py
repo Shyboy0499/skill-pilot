@@ -355,7 +355,7 @@ def _run_health_check() -> None:
     platforms = _load_social_schedule_config().get("platforms", ["linkedin", "x"])
 
     for platform in platforms:
-        script = str(_REPO_ROOT / "social-media" / "scripts" / f"{platform}.py")
+        script = str(_REPO_ROOT / "workspace" / "social-media" / "scripts" / f"{platform}.py")
         if not Path(script).exists():
             logger.warning(f"[health-check] Script not found: {script}")
             continue
@@ -369,7 +369,7 @@ def _run_health_check() -> None:
                 logger.warning(f"[health-check] {platform}: FAILED — {proc.stderr[:200]}")
                 repair_config = _load_social_schedule_config().get("health_check", {})
                 if repair_config.get("auto_repair", True):
-                    repair_script = str(_REPO_ROOT / "social-media" / "scripts" / "repair.py")
+                    repair_script = str(_REPO_ROOT / "workspace" / "social-media" / "scripts" / "repair.py")
                     logger.info(f"[health-check] Triggering auto-repair for {platform}...")
                     subprocess.run(
                         [sys.executable, repair_script, "--auto", platform],
@@ -387,7 +387,7 @@ def _run_health_check() -> None:
 def _run_content_evaluation() -> None:
     """Check for posts published 48h+ ago that need AI evaluation."""
     logger.info("[content-eval] Starting content evaluation scan...")
-    eval_script = str(_REPO_ROOT / "social-media" / "scripts" / "evaluate.py")
+    eval_script = str(_REPO_ROOT / "workspace" / "social-media" / "scripts" / "evaluate.py")
     if not Path(eval_script).exists():
         logger.warning(f"[content-eval] Script not found: {eval_script}")
         return
