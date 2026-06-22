@@ -28,3 +28,9 @@ skillpilot-ssh-key
 .pytest_cache
 
 output
+# social-media runtime artifacts (workspace only, not tracked)
+workspace/social-media/auth/
+workspace/social-media/logs/
+workspace/social-media/screenshots/
+workspace/social-media/posts/published/
+workspace/social-media/posts/failed/
